@@ -2082,6 +2082,83 @@
 +        modificati.append(nodo['id'])
 +    return modificati
 +
+--- a/Alpha/listino.py
++++ b/Alpha/listino.py
+@@ -96,3 +96,35 @@
+         'descrizione': descrizione(codice) if trovato else None,
+         'suggerimenti': [] if trovato else suggerimenti(codice),
+     }
++
++
++# Coppie di caratteri che l'OCR scambia spesso (lette in entrambe le direzioni).
++_CONFUSIONI = ('01', '0O', '0D', '1I', '1L', '1T', '1A', '25', '2Z', '35', '3S', '4A', '5S', '6G', '8B', '8S')
++
++
++@lru_cache(maxsize=1)
++def _scambi() -> dict:
++    scambi: dict[str, set[str]] = {}
++    for a, b in _CONFUSIONI:
++        scambi.setdefault(a, set()).add(b)
++        scambi.setdefault(b, set()).add(a)
++    return scambi
++
++
++def correggi_ocr(codice: str) -> str | None:
++    """Unico codice di listino raggiungibile scambiando UN carattere confuso dall'OCR.
++
++    Restituisce None se il codice e' gia' valido, se non c'e' nessuna correzione
++    o se ce ne sono piu' di una (ambiguo: lo decide l'operatore).
++    """
++    codice = normalizza(codice)
++    if not codice or esiste(codice):
++        return None
++    scambi = _scambi()
++    candidati = set()
++    for i, carattere in enumerate(codice):
++        for altro in scambi.get(carattere, ()):
++            variante = codice[:i] + altro + codice[i + 1:]
++            if esiste(variante):
++                candidati.add(variante)
++    return candidati.pop() if len(candidati) == 1 else None
+--- a/Alpha/rossi_vision.py
++++ b/Alpha/rossi_vision.py
+@@ -193,10 +193,24 @@
+     return [[str(x) for x in r] if isinstance(r, list) else [] for r in righe], answer.get('usage', {})
+ 
+ 
++def _correggi(trovati: list[str]) -> tuple[list[str], list[dict]]:
++    """Corregge i codici fuori listino con la sola confusione OCR univoca; il resto resta com'e'."""
++    finali, correzioni = [], []
++    for c in trovati:
++        proposto = None if listino.esiste(c) else listino.correggi_ocr(c)
++        if proposto:
++            correzioni.append({'letto': c, 'proposto': proposto})
++        finali.append(proposto or c)
++    return finali, correzioni
++
++
+ def _valida(testo: str) -> dict:
+-    trovati = codici(testo)
+-    return {'codici': [c for c in trovati if listino.esiste(c)],
+-            'nonInListino': [{'codice': c, 'suggerimenti': listino.suggerimenti(c)} for c in trovati if not listino.esiste(c)]}
++    trovati, correzioni = _correggi(codici(testo))
++    esito = {'codici': [c for c in trovati if listino.esiste(c)],
++             'nonInListino': [{'codice': c, 'suggerimenti': listino.suggerimenti(c)} for c in trovati if not listino.esiste(c)]}
++    if correzioni:
++        esito['correzioniOcr'] = correzioni
++    return esito
+ 
+ 
+ def _punteggio(righe: list[str]) -> tuple[int, int]:
+@@ -250,7 +264,7 @@
+             righe = [(o['text'], [(x0 + o['box'][0]) / SCALA, (y0 + o['box'][1]) / SCALA,
+                                   (x0 + o['box'][2]) / SCALA, (y0 + o['box'][3]) / SCALA], o['conf']) for o in righe_ocr]
+         for testo, box, conf in righe:
+-            letti = codici(testo)
++            letti = _correggi(codici(testo))[0]
+             spans.append({'text': ' '.join(letti) or testo, 'rawText': testo, 'box': box, 'color': ROSSO, 'source': 'claude_vision' if usa_vision else 'ocr',
+                           'ocrConfidence': conf, 'ocrLines': [o['text'] for o in righe_ocr],
+                           'visionLines': righe_vis or None, 'cropBox': p['box'], **_valida(testo)})
 --- a/strumenti/report_golden.py
 +++ b/strumenti/report_golden.py
 @@ -61,9 +61,11 @@
@@ -2227,6 +2304,25 @@
 +    nodi = [_n('p', 50, kind='QS', page=7), _n('a', 263, 'p', page=18), _n('r', 427, page=18)]
 +    assert us.adotta(nodi) == ['r']
 +    assert nodi[2]['parent'] == 'p'
+--- /dev/null
++++ b/tests/test_ocr_correzione.py
+@@ -0,0 +1,16 @@
++import listino
++
++
++def test_corregge_confusione_univoca():
++    assert listino.correggi_ocr('M78230') == 'M7S230'
++    assert listino.correggi_ocr('1724B250') == 'T724B250'
++    assert listino.correggi_ocr('G701T/S5N') == 'G701T/35N'
++    assert listino.correggi_ocr('FA0HB4') == 'F10HB4'
++
++
++def test_codice_valido_non_modificato():
++    assert listino.correggi_ocr('FT84C32') is None
++
++
++def test_codice_sconosciuto_senza_correzione():
++    assert listino.correggi_ocr('ZZZZZZ9') is None
 --- a/Alpha/frontend/src/hierarchy.ts
 +++ b/Alpha/frontend/src/hierarchy.ts
 @@ -79,7 +79,8 @@
