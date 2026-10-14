@@ -1,6 +1,18 @@
 --- a/Alpha/engine.py
 +++ b/Alpha/engine.py
-@@ -227,8 +227,6 @@
+@@ -219,7 +219,10 @@
+   for index,tag in enumerate(['ARTICOLO','COSTRUTTORE','POLI','IN_A','CURVA','KA','IDN','TIPO_DIFF','PROJECT_IN_A','IR_A','CATALOGUE_POLES','PROJECT_KA','KA_BASIS','KA_VOLTAGE','KA_SOURCE','KA_REVIEW']):
+    if tag not in present:block.add_attdef(tag,(0,-80-3*index),text='',dxfattribs={'flags':1,'height':1})
+  from measurement_composition import prepare as prepare_measurements,draw as draw_measurement
+- measurement_groups=prepare_measurements(doc,STUDIO,project.get('measurementAssemblies',[]))
++ all_measurements=project.get('measurementAssemblies',[])
++ skipped_measurements=[r for r in all_measurements if not r.get('measuredFeeder')] if preview_only else []
++ measurement_groups=prepare_measurements(doc,STUDIO,[r for r in all_measurements if r not in skipped_measurements])
++ not_drawn={'misureNonDisegnate':[{'pagina':r.get('page'),'strumento':r.get('articleProposal')} for r in skipped_measurements]} if skipped_measurements else {}
+  if not set(measurement_groups).issubset(byid):raise ValueError('Linea misurata non presente nel diagramma: nessuna misura puo essere omessa.')
+  packed_nodes=[{**n,'drawingWidth':6} if n['id'] in measurement_groups else n for n in byid.values()]
+  pages,positions,children,inline_contacts=plan_series(packed_nodes)
+@@ -227,8 +230,6 @@
   has_front=project.get('hasMhq') is not False and bool(project.get('mhq',{}).get('exportId'))
   from cover_page import reserve_front_pages,append_title_cover,append_index,project_metadata,fit_title_attribute
   reserve_front_pages(pages,positions)
@@ -9,7 +21,7 @@
   measurement_feeders=set(measurement_groups)
   total_pages=len(pages)+2+int(has_front)
   destinations=collections.defaultdict(list)
-@@ -275,7 +273,8 @@
+@@ -275,7 +276,8 @@
     parent=group['parent'];items=group['items'];bus_y=sy+group['bus_y'];first_x=items[0]['x'] if items else group['incoming_x'];last_x=group['last_x']
     if parent and positions[parent]['page']==physical:
      px=positions[parent]['x'];lane=packed['lanes'][parent]
@@ -19,7 +31,7 @@
     elif parent:
      line((group['incoming_x'],bus_y),(last_x,bus_y))
     elif len(items)==1 and packed['external_column'] is not None:
-@@ -351,8 +350,7 @@
+@@ -351,8 +353,7 @@
     elif phase:text(phase,x+7,sy+175,1.6)
     if not children[n['id']] and n['id'] not in measurement_feeders:m.add_circle((x,sy+142.5),1.2)
     if n['id'] in measurement_groups:
@@ -29,15 +41,21 @@
     if is_inline:continue # Contact attributes retain its own article; one circuit cartiglio.
     text(n['sigla'],x,sy+127.5)
     for k,y in fieldrows.items():
-@@ -398,7 +396,7 @@
+@@ -397,11 +398,11 @@
+  if preview_only and not native_preview:return {'dxf':str(dxf),'pdf':str(pdf) if pdf else None,'pages':report,'folder':str(folder),'confirmed':False}
   dwg=folder/'schema.dwg';script=folder/'salva.scr';script.write_text('\n'.join(['(setvar "FILEDIA" 0)','(setvar "FIELDEVAL" 0)','(command "_.AUDIT" "_Yes")',f'(command "_.SAVEAS" "2018" "{dwg.as_posix()}")','(command "_.AUDIT" "_No")','_.QUIT','_Yes','']),encoding='ascii')
   exe=config.percorso('autocad_console')
-  if not exe.exists():return {'exportId':token,'dxf':f'/exports/{token}/schema.dxf','warning':'AutoCAD Core Console non disponibile; esportato DXF.'}
+- if not exe.exists():return {'exportId':token,'dxf':f'/exports/{token}/schema.dxf','warning':'AutoCAD Core Console non disponibile; esportato DXF.'}
 - r=subprocess.run([str(exe),'/i',str(dxf),'/s',str(script),'/l','en-US'],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,creationflags=subprocess.CREATE_NO_WINDOW,timeout=90);raw=r.stdout;log=raw.decode('utf-16-le',errors='replace') if raw.count(b'\0')>len(raw)//8 else raw.decode(errors='replace');log=log.replace('\0','');(folder/'AutoCAD.log').write_text(log,encoding='utf-8')
++ if not exe.exists():return {'exportId':token,'dxf':f'/exports/{token}/schema.dxf','warning':'AutoCAD Core Console non disponibile; esportato DXF.',**not_drawn}
 + r=subprocess.run([str(exe),'/i',str(dxf),'/s',str(script),'/l','en-US'],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0),timeout=90);raw=r.stdout;log=raw.decode('utf-16-le',errors='replace') if raw.count(b'\0')>len(raw)//8 else raw.decode(errors='replace');log=log.replace('\0','');(folder/'AutoCAD.log').write_text(log,encoding='utf-8')
   if not dwg.exists() or not re.search(r'Total errors found\s+0\s+fixed\s+0',log):
    if preview_only and pdf and pdf.exists():
-    return {'exportId':token,'pdf':f'/exports/{token}/schema.pdf','dxf':f'/exports/{token}/schema.dxf','pages':len(report),'devices':len(byid),'previewOnly':True,'confirmed':False,'warning':'Bozza PDF generata. DWG non verificato: consultare AutoCAD.log.','report':f'/exports/{token}/AutoCAD.log'}
+-   return {'exportId':token,'pdf':f'/exports/{token}/schema.pdf','dxf':f'/exports/{token}/schema.dxf','pages':len(report),'devices':len(byid),'previewOnly':True,'confirmed':False,'warning':'Bozza PDF generata. DWG non verificato: consultare AutoCAD.log.','report':f'/exports/{token}/AutoCAD.log'}
++   return {'exportId':token,'pdf':f'/exports/{token}/schema.pdf','dxf':f'/exports/{token}/schema.dxf','pages':len(report),'devices':len(byid),'previewOnly':True,'confirmed':False,'warning':'Bozza PDF generata. DWG non verificato: consultare AutoCAD.log.','report':f'/exports/{token}/AutoCAD.log',**not_drawn}
+   raise ValueError('DWG non verificato: consultare il log AutoCAD.')
+  (folder/'verifica.json').write_text(json.dumps({'preview_only':preview_only,'native_audit_errors':0,'device_count':len(byid),'pages':report,'all_geometry_in_model':True,'paper':'A4 landscape','viewport_locked':True,'limitations':['No cable sizing, selectivity or assembly verification is performed.','CAD correctness and catalogue filtering do not establish electrical compliance.']},indent=2),encoding='utf-8')
+  return {'exportId':token,'dwg':f'/exports/{token}/schema.dwg','dxf':f'/exports/{token}/schema.dxf','pdf':f'/exports/{token}/schema.pdf' if pdf else None,'report':f'/exports/{token}/verifica.json','pages':len(report),'devices':len(byid),'auditErrors':0,'previewOnly':preview_only,'confirmed':not preview_only}
 --- a/Alpha/packing.py
 +++ b/Alpha/packing.py
 @@ -33,7 +33,7 @@
@@ -96,7 +114,7 @@
    text(sigla,column,sy+127.5,1.8);text(label,column,sy+118,1.3);text(article,column,sy+103,1.7)
 --- /dev/null
 +++ b/Alpha/measurement_placement.py
-@@ -0,0 +1,163 @@
+@@ -0,0 +1,199 @@
 +"""Posizionamento scelto dall'operatore per i moduli di misura (multimetro + TA).
 +
 +Prima di disegnare una misura il sistema chiede:
@@ -256,10 +274,46 @@
 +    occupati: dict[str, str] = {}
 +    for misura in misure:
 +        feeder = misura.get('measuredFeeder')
++        if feeder is None:
++            continue
 +        if feeder in occupati:
 +            raise ValueError('Due misure sullo stesso interruttore: composizione ancora da definire.')
 +        occupati[feeder] = misura['id']
 +    return risultato
++
++
++def misure_da_collocare(misure: list[dict], componenti: list[dict]) -> list[dict]:
++    """Strumenti di misura trovati dall'articolo ma senza geometria di TA riconosciuta.
++
++    Non si sceglie l'interruttore misurato da una vicinanza: il blocco nasce senza
++    `measuredFeeder` e l'operatore lo colloca (modo e interruttore) dal pannello.
++    """
++    nuove = []
++    for strumento in componenti:
++        if strumento.get('family') != 'Strumenti di misura' or strumento.get('linkedMeasurementId'):
++            continue
++        pagina, box = strumento.get('page'), strumento.get('box')
++        if not box:
++            continue
++        compagni = [c['article'] for c in componenti
++                    if c is not strumento and c.get('page') == pagina and not c.get('linkedMeasurementId')
++                    and abs(c['box'][0] - box[0]) < 3 and 0 <= c['box'][1] - box[3] < 4]
++        misura = {
++            'id': uuid.uuid4().hex[:12], 'page': pagina, 'status': 'unplaced', 'confirmed': False,
++            'meterBox': None, 'ctGeometry': None, 'articleProposal': strumento['article'], 'articleBox': box,
++            'articleAssociation': 'article_without_geometry', 'relatedQuotationArticles': compagni,
++            'measuredFeeder': None, 'measuredFeederConfirmed': False,
++            'auxiliaryFeeds': {'L': None, 'N': None}, 'ratio': None, 'quantity': None,
++            'voltageProtection': None, 'requiresIntegration': True,
++            'limitations': ['Strumento trovato dal solo articolo rosso: collocare la misura (modo e interruttore) prima del disegno.'],
++        }
++        strumento['linkedMeasurementId'] = misura['id']
++        for compagno in componenti:
++            if compagno['article'] in compagni and compagno.get('page') == pagina and not compagno.get('linkedMeasurementId'):
++                compagno['linkedMeasurementId'] = misura['id']
++        nuove.append(misura)
++    misure.extend(nuove)
++    return nuove
 --- a/Alpha/pdf_annotazioni.py
 +++ b/Alpha/pdf_annotazioni.py
 @@ -85,3 +85,26 @@
@@ -367,6 +421,16 @@
   # Raster schedules can still expose bus segments after vector geometry has
   # been flattened. Treat each uninterrupted segment as evidence; never infer
   # that every device on a sheet is downstream of the largest breaker.
+@@ -838,6 +843,9 @@
+   item['redAnnotations']=[{'text':note['text'],'box':note['bbox'],'catalogueMatch':note['catalogueMatch']} for note in notes if note['page']==item['page']]
+  update('anteprime',96,'Verifica finale delle evidenze sovrapposte al PDF.',previewPages=project['scanPreview'],currentPage=len(doc),totalPages=len(doc),nodesDetected=len(nodes))
+  if protective_networks:project['protectiveNetworks']=protective_networks
++ if unresolved_components:
++  from measurement_placement import misure_da_collocare
++  misure_da_collocare(measurement_assemblies,unresolved_components)
+  if measurement_assemblies:project['measurementAssemblies']=measurement_assemblies
+  if requirements:
+   requirements['previousSettings']=initial_settings;project['boardRequirements']=requirements
 --- a/Alpha/pdf_signal_references.py
 +++ b/Alpha/pdf_signal_references.py
 @@ -66,7 +66,7 @@
@@ -574,7 +638,7 @@
 +    assert pagine[0]['lanes']['a'] == posizioni['a']['x'] + 25
 --- /dev/null
 +++ b/tests/test_measurement_placement.py
-@@ -0,0 +1,61 @@
+@@ -0,0 +1,98 @@
 +import pytest
 +
 +import measurement_placement as mp
@@ -636,6 +700,43 @@
 +    p['nodes'].append({'id': 'h', 'sigla': 'QS9', 'parent': None, 'values': {}})
 +    with pytest.raises(ValueError):
 +        mp.posiziona(p, [{'modo': 'downstream_general', 'strumento': 'MFD4421'}])
++
++
++def _comp(page, article, box, family='Strumenti di misura'):
++    return {'page': page, 'article': article, 'box': box, 'family': family}
++
++
++def test_strumento_senza_geometria_diventa_misura_da_collocare():
++    comps = [_comp(7, 'MFD4421', [339, 226, 374, 235]), _comp(7, 'F8TB100', [339, 235, 372, 244], 'Altri apparecchi'),
++             _comp(9, 'F323N', [10, 10, 30, 20], 'Fusibili')]
++    misure = []
++    nuove = mp.misure_da_collocare(misure, comps)
++    assert len(nuove) == 1 and misure == nuove
++    m = nuove[0]
++    assert m['status'] == 'unplaced' and m['measuredFeeder'] is None
++    assert m['relatedQuotationArticles'] == ['F8TB100']
++    assert all(c.get('linkedMeasurementId') == m['id'] for c in comps[:2])
++    assert 'linkedMeasurementId' not in comps[2]
++
++
++def test_strumento_gia_collegato_non_duplicato():
++    comps = [dict(_comp(5, 'MFD41ORFCDT', [1, 1, 9, 9]), linkedMeasurementId='x')]
++    assert mp.misure_da_collocare([], comps) == []
++
++
++def test_misura_da_collocare_si_posiziona_con_le_scelte_operatore():
++    p = _progetto()
++    p['measurementAssemblies'] = [{'id': 'u1', 'status': 'unplaced', 'measuredFeeder': None, 'articleProposal': 'MFD4421'}]
++    r = mp.posiziona(p, [{'misura': 'u1', 'modo': 'downstream_device', 'dispositivo': 'a'}])
++    m = r['measurementAssemblies'][0]
++    assert m['measuredFeeder'] == 'a' and m['assignmentSource'] == 'operator'
++
++
++def test_piu_misure_non_collocate_non_sono_un_conflitto():
++    p = _progetto()
++    p['measurementAssemblies'] = [{'id': 'u1', 'measuredFeeder': None}, {'id': 'u2', 'measuredFeeder': None}]
++    r = mp.posiziona(p, [{'misura': 'u1', 'modo': 'downstream_device', 'dispositivo': 'a'}])
++    assert r['measurementAssemblies'][0]['measuredFeeder'] == 'a' and r['measurementAssemblies'][1]['measuredFeeder'] is None
 --- /dev/null
 +++ b/tests/test_unwired_siblings.py
 @@ -0,0 +1,35 @@
@@ -863,13 +964,14 @@
      function undo() { const previous = history.at(-1); if (!previous)
          return; try {
          learning.enqueue(corrections(current.current, previous, 'undo_operator'));
-@@ -323,10 +335,10 @@
+@@ -323,10 +335,11 @@
   <header className="studio-header"><div className="brand">BTicino Studio <span>ALPHA 0.3</span></div><nav><Button onClick={() => file.current?.click()} disabled={!!busy || !ready}>Importa PDF</Button><Button disabled={!project.nodes.length || !!busy} onClick={() => setDrawingData('draft')}>Bozza PDF</Button><Button type="primary" disabled={!project.nodes.length || !!busy} onClick={() => setDrawingData('export')}>Genera DWG</Button><Dropdown menu={{ onClick: ({ key }) => void more(key), items: [{ key: 'save', label: 'Salva progetto' }, { key: 'open', label: 'Apri progetto salvato' }, { type: 'divider' }, { key: 'drawingData', label: 'Dati del quadro e cartigli' }, { key: 'settings', label: 'Impostazioni quadro e MHQ' }, { key: 'memory', label: 'Memoria di apprendimento' }, { key: 'legacy', label: 'Editor precedente · verifiche specialistiche' }] }} trigger={['click']} disabled={!!busy}><Button>Altro</Button></Dropdown></nav></header>
   <input type="file" ref={file} accept=".pdf" hidden onChange={e => { const f = e.target.files?.[0]; e.target.value = ''; if (f)
          void loadPdf(f); }}/>
 - <div className="project-bar"><div><span className="eyebrow">SCHEMA / ALIMENTAZIONI</span><h2>{project.name}</h2><span className="muted">{pending} schede da verificare{ambiguities ? ` · ${ambiguities} letture ambigue` : ''}{learning.pending ? ` · ${learning.pending} correzioni da sincronizzare` : ''}</span></div><Space wrap>{ambiguities > 0 && <Button type="primary" onClick={() => setDrawer('guided')}>Rivedi {ambiguities} letture</Button>}<Button onClick={() => setDrawer('scan')}>Documento</Button><Button onClick={() => setDrawer('add')} disabled={!!busy}>+ Apparecchio</Button><Dropdown trigger={['click']} menu={{ items: [{ key: 'arrange', label: 'Riordina gerarchia' }, { key: 'undo', label: 'Annulla modifica', disabled: !history.length }, { key: 'review', label: 'Controlli del progetto' }], onClick: ({ key }) => key === 'undo' ? undo() : void more(key) }} disabled={!!busy}><Button>Modifica</Button></Dropdown><Button danger onClick={() => setClearOpen(true)} disabled={!!busy}>Svuota</Button></Space></div>
 + <div className="project-bar"><div><span className="eyebrow">SCHEMA / ALIMENTAZIONI</span><h2>{project.name}</h2><span className="muted">{pending} schede da verificare{ambiguities ? ` · ${ambiguities} letture ambigue` : ''}{learning.pending ? ` · ${learning.pending} correzioni da sincronizzare` : ''}</span></div><Space wrap>{ambiguities > 0 && <Button type="primary" onClick={() => setDrawer('guided')}>Rivedi {ambiguities} letture</Button>}<Button onClick={() => setDrawer('scan')}>Documento</Button><Button onClick={() => setDrawer('add')} disabled={!!busy}>+ Apparecchio</Button><Button onClick={() => setMeasurePanel({id:null})} disabled={!!busy||!project.nodes.length}>+ Multimetro e TA</Button><Dropdown trigger={['click']} menu={{ items: [{ key: 'arrange', label: 'Riordina gerarchia' }, { key: 'undo', label: 'Annulla modifica', disabled: !history.length }, { key: 'review', label: 'Controlli del progetto' }], onClick: ({ key }) => key === 'undo' ? undo() : void more(key) }} disabled={!!busy}><Button>Modifica</Button></Dropdown><Button danger onClick={() => setClearOpen(true)} disabled={!!busy}>Svuota</Button></Space></div>
   {notice && <Alert className="notice" title={notice} closable onClose={() => setNotice('')} type="info"/>}{learning.error && <Alert title={`Memoria non sincronizzata: ${learning.error}. Le correzioni restano nella coda locale.`} type="warning" action={<Button onClick={() => void learning.retry()}>Riprova</Button>}/>}
++ {(project.measurementAssemblies||[]).some((m: any)=>!m.measuredFeeder)&&<Alert className="notice" type="warning" title={`${(project.measurementAssemblies||[]).filter((m: any)=>!m.measuredFeeder).length} misure da collocare: scegli dove misurare`} description={<Space wrap>{(project.measurementAssemblies||[]).filter((m: any)=>!m.measuredFeeder).map((m: any)=><Button key={m.id} size="small" onClick={()=>setMeasurePanel({id:m.id})}>{m.articleProposal||'Strumento'}{m.page?` · pag. ${m.page}`:''}</Button>)}</Space>}/>}
   {reviewProject && !reviewOpen && <Alert title='Revisione PDF in attesa' action={<Button onClick={() => setReviewOpen(true)}>Riprendi revisione</Button>}/>}
 - {drawingData && <DrawingData project={project} onClose={()=>setDrawingData(null)} onApply={next=>{if(commit(next,'drawing_metadata')){const mode=drawingData;setDrawingData(null);if(mode!=='edit')void exportDrawing(mode==='draft',next);}}}/>}{drawer === 'guided' && <ReviewWizard project={project} onClose={() => setDrawer(null)} onChange={p => { commit(p, 'guided_review'); }} onDraft={() => { setDrawer(null); setDrawingData('draft'); }}/>}<Diagram nodes={project.nodes as LayoutNode<Device>[]} selected={selected} onSelect={setSelected} onMove={move} onConnect={askConnection} onImport={() => file.current?.click()} disabled={!!busy || !ready}/>
 + {drawingData && <DrawingData project={project} onClose={()=>setDrawingData(null)} onApply={next=>{if(commit(next,'drawing_metadata')){const mode=drawingData;setDrawingData(null);if(mode!=='edit')void exportDrawing(mode==='draft',next);}}}/>}{drawer === 'guided' && <ReviewWizard project={project} onClose={() => setDrawer(null)} onChange={p => { commit(p, 'guided_review'); }} onDraft={() => { setDrawer(null); setDrawingData('draft'); }}/>}<Diagram nodes={project.nodes as LayoutNode<Device>[]} selected={selected} onSelect={setSelected} onMove={move} onConnect={askConnection} onImport={() => file.current?.click()} disabled={!!busy || !ready} measurements={project.measurementAssemblies||[]} selectedMeasurement={measurePanel?.id??null} onSelectMeasurement={id=>setMeasurePanel({id})} onMoveMeasurement={(id,deviceId)=>void moveMeasurement(id,deviceId)}/>{measurePanel&&<MeasurementPanel key={(measurePanel.id||'nuova')+(measurePanel.deviceId||'')} project={project} measurementId={measurePanel.id} deviceId={measurePanel.deviceId} onClose={()=>setMeasurePanel(null)} onApply={next=>{if(commit(next,'measurement_placement'))setMeasurePanel(null);}}/>}
