@@ -29,6 +29,15 @@
     if is_inline:continue # Contact attributes retain its own article; one circuit cartiglio.
     text(n['sigla'],x,sy+127.5)
     for k,y in fieldrows.items():
+@@ -398,7 +396,7 @@
+  dwg=folder/'schema.dwg';script=folder/'salva.scr';script.write_text('\n'.join(['(setvar "FILEDIA" 0)','(setvar "FIELDEVAL" 0)','(command "_.AUDIT" "_Yes")',f'(command "_.SAVEAS" "2018" "{dwg.as_posix()}")','(command "_.AUDIT" "_No")','_.QUIT','_Yes','']),encoding='ascii')
+  exe=config.percorso('autocad_console')
+  if not exe.exists():return {'exportId':token,'dxf':f'/exports/{token}/schema.dxf','warning':'AutoCAD Core Console non disponibile; esportato DXF.'}
+- r=subprocess.run([str(exe),'/i',str(dxf),'/s',str(script),'/l','en-US'],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,creationflags=subprocess.CREATE_NO_WINDOW,timeout=90);raw=r.stdout;log=raw.decode('utf-16-le',errors='replace') if raw.count(b'\0')>len(raw)//8 else raw.decode(errors='replace');log=log.replace('\0','');(folder/'AutoCAD.log').write_text(log,encoding='utf-8')
++ r=subprocess.run([str(exe),'/i',str(dxf),'/s',str(script),'/l','en-US'],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0),timeout=90);raw=r.stdout;log=raw.decode('utf-16-le',errors='replace') if raw.count(b'\0')>len(raw)//8 else raw.decode(errors='replace');log=log.replace('\0','');(folder/'AutoCAD.log').write_text(log,encoding='utf-8')
+  if not dwg.exists() or not re.search(r'Total errors found\s+0\s+fixed\s+0',log):
+   if preview_only and pdf and pdf.exists():
+    return {'exportId':token,'pdf':f'/exports/{token}/schema.pdf','dxf':f'/exports/{token}/schema.dxf','pages':len(report),'devices':len(byid),'previewOnly':True,'confirmed':False,'warning':'Bozza PDF generata. DWG non verificato: consultare AutoCAD.log.','report':f'/exports/{token}/AutoCAD.log'}
 --- a/Alpha/packing.py
 +++ b/Alpha/packing.py
 @@ -33,7 +33,7 @@
@@ -280,6 +289,1799 @@
 +        if da_chiudere is not None:
 +            da_chiudere.close()
 +    return conteggio
+--- a/Alpha/pdf_import.py
++++ b/Alpha/pdf_import.py
+@@ -1,850 +1,855 @@
+-"""Local PDF interpretation: annotations, table OCR and vector-wire evidence.
+-Every proposal remains unconfirmed. Missing evidence never implies an external feed.
+-"""
+-import re,json,pathlib,subprocess,collections,uuid,csv,io
+-from engine import ROOT,STUDIO,CAT,specs,classify,rating,select_device,validate_device_rating
+-import pymupdf
+-from PIL import Image
+-from board_requirements import extract as extract_requirements,apply as apply_requirements
+-from pdf_topology import trace_page,connect_pages
+-from pdf_signal_references import read_signal_arrows
+-from pdf_unknown_power import unknown_switches,locate_switch,segments as switch_segments
+-from pdf_contactors import detect as detect_contactors,associate_labels as associate_contactor_labels
+-from pdf_junctions import junctions
+-from pdf_wire_geometry import orientation as wire_orientation
+-from switch_drawing import conductor_spec
+-from pdf_protective_earth import from_page as protective_earth_from_page,page_segments as earth_segments,trace_outlets as trace_earth_outlets
+-from component_inventory import collect as collect_components,STANDARD as STANDARD_COMPONENTS
+-from document_evidence import collect as collect_evidence
+-from pdf_measurement import detect as detect_measurement
+-from pdf_measurement_fuses import attach as attach_measurement_fuses
+-from pdf_annotazioni import estrai_articoli as annotation_articles
+-import rossi_vision
+-
+-import config
+-TESSERACT=config.percorso('tesseract')
+-
+-def attach_catalogued_auxiliaries(page_nodes,components,page_index):
+- """Attach red auxiliary-contact codes to the nearest breaker column.
+-
+- The code stays in its own first-free accessory attribute slot; a differential
+- module already occupying accessorio_a is never overwritten.
+- """
+- breakers=[n for n in page_nodes if n.get('kind') in ('MT','MTD','QS')]
+- if not breakers:return []
+- axes=sorted({float(n.get('evidence',{}).get('axis',0)) for n in breakers})
+- spacing=min((b-a for a,b in zip(axes,axes[1:])),default=56.0)
+- attached=[]
+- for component in components:
+-  if component.get('page')!=page_index+1 or component.get('electricalFunction')!='CONTATTO_AUSILIARIO_DI_STATO':continue
+-  box=component.get('box') or []; 
+-  if len(box)!=4:continue
+-  x=(box[0]+box[2])/2
+-  ranked=sorted(((abs(float(n['evidence']['axis'])-x),n) for n in breakers),key=lambda item:item[0])
+-  if not ranked or ranked[0][0]>max(18.0,spacing*.55):continue
+-  if len(ranked)>1 and abs(ranked[1][0]-ranked[0][0])<2.0:continue
+-  node=ranked[0][1];article=component['article'];values=node.setdefault('values',{})
+-  if article in node.get('articles',[]):
+-   component['linkedPowerNode']=node['id'];continue
+-  slot=next((key for key in ('accessorio_a','accessorio_b','accessorio_c') if not values.get(key)),None)
+-  if slot is None:
+-   component['integrationStatus']='accessorio_rilevato_slot_esauriti';component['linkedPowerNode']=node['id'];continue
+-  values[slot]=article;node.setdefault('articles',[]).append(article)
+-  accessory={'article':article,'slot':slot,'function':component['electricalFunction'],'source':'red_code_and_local_listino','symbol':'BT_F80RC05'}
+-  node.setdefault('accessories',[]).append(accessory)
+-  node.setdefault('evidence',{}).setdefault('catalogueAccessoryEvidence',[]).append({'article':article,'box':box,'slot':slot,'manufacturerDescription':component.get('manufacturerDescription','')})
+-  node.setdefault('warnings',[]).append(f'{article}: contatto ausiliario di stato proposto nello slot {slot}; verificare il contatto e la posizione sul PDF.')
+-  component['linkedPowerNode']=node['id'];component['integrationStatus']='contatto_ausiliario_associazione_proposta';component['requiresIntegration']=False
+-  attached.append({'article':article,'node':node['sigla'],'slot':slot})
+- return attached
+-
+-def attach_catalogued_symbols(page_nodes,components,page_index):
+- """Keep red-coded non-breaker apparatus in the drawing review model."""
+- attachable={'SPD'}
+- devices=[n for n in page_nodes if n.get('kind') in ('MT','MTD','RCD','QS')]
+- attached=[]
+- for component in components:
+-  if component.get('page')!=page_index+1 or component.get('electricalFunction') not in attachable:continue
+-  box=component.get('box') or []
+-  if len(box)!=4 or not devices:continue
+-  x=(box[0]+box[2])/2
+-  ranked=[]
+-  for node in devices:
+-   # The red callout's text origin is often offset from the switch axis.
+-   # Prefer the center of its red article box when associating nearby symbols.
+-   ref=node.get('evidence',{}).get('redCodeAxis',node.get('evidence',{}).get('axis',0))
+-   ranked.append((abs(float(ref)-x),node))
+-  ranked.sort(key=lambda item:item[0])
+-  if not ranked:continue
+-  node=ranked[0][1];modules=node.setdefault('catalogueModules',[])
+-  if any(m.get('article')==component['article'] and m.get('box')==box for m in modules):continue
+-  module={'article':component['article'],'function':component['electricalFunction'],'source':'red_code_and_local_catalogue','box':box,'associationStatus':'proposed','manufacturerDescription':component.get('manufacturerDescription','')}
+-  modules.append(module)
+-  if component['article'] not in node.setdefault('articles',[]):node['articles'].append(component['article'])
+-  values=node.setdefault('values',{})
+-  slot=next((key for key in ('accessorio_a','accessorio_b','accessorio_c') if not values.get(key)),None)
+-  if slot:values[slot]=component['article'];module['slot']=slot
+-  node.setdefault('evidence',{}).setdefault('catalogueModuleEvidence',[]).append(module.copy())
+-  node.setdefault('warnings',[]).append(f"{component['article']}: simbolo nativo inserito come apparecchio rilevato; associazione elettrica da verificare sul progetto.")
+-  component['linkedPowerNode']=node['id'];component['integrationStatus']='simbolo_nativo_associazione_proposta';component['requiresIntegration']=True
+-  attached.append({'article':component['article'],'node':node['sigla'],'function':component['electricalFunction']})
+- return attached
+-
+-def raster_spans(page,folder,index,red_only=False):
+- """Read outlines/raster annotations locally; preserve the original word boxes."""
+- if not TESSERACT.is_file():return []
+- pix=page.get_pixmap(matrix=pymupdf.Matrix(3,3),alpha=False);image=Image.frombytes('RGB',[pix.width,pix.height],pix.samples)
+- if red_only:
+-  import numpy as np
+-  rgb=np.asarray(image);mask=(rgb[:,:,0]>150)&(rgb[:,:,1]<125)&(rgb[:,:,2]<125)&(rgb[:,:,0].astype(int)-rgb[:,:,1].astype(int)>60)
+-  if mask.sum()<20:return []
+-  image=Image.fromarray(np.where(mask,0,255).astype('uint8'))
+- file=folder/f'ocr_page_{index}_{"red" if red_only else "black"}.png';image.save(file)
+- result=subprocess.run([str(TESSERACT),str(file),'stdout','--psm','11','tsv'],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,creationflags=subprocess.CREATE_NO_WINDOW,timeout=45)
+- words=[]
+- for r in csv.DictReader(io.StringIO(result.stdout.decode('utf-8',errors='replace')),delimiter='\t'):
+-  if not r.get('text','').strip():continue
+-  x,y,w,h=[int(r[k])/3 for k in ['left','top','width','height']]
+-  words.append({'text':r['text'].strip(),'box':[x,y,x+w,y+h],'color':0xff0000 if red_only else 0,'ocrConfidence':float(r['conf'])})
+- return words
+-
+-def spans(page):
+- return [{'text':s['text'].strip(),'box':list(pymupdf.Rect(s['bbox'])*page.rotation_matrix),'color':s['color']} for b in page.get_text('dict')['blocks'] for l in b.get('lines',[]) for s in l['spans'] if s['text'].strip()]
+-
+-def vector_lines(page):
+- lines=[]
+- for drawing in page.get_drawings():
+-  if drawing.get('dashes','[] 0') not in ['[] 0','[] 0.0','']:continue
+-  for item in drawing['items']:
+-   if item[0]!='l':continue
+-   a,b=item[1]*page.rotation_matrix,item[2]*page.rotation_matrix
+-   if wire_orientation(a,b):lines.append(((a.x,a.y),(b.x,b.y)))
+- return lines
+-
+-def schedule_column_centers(page):
+- """Estimate raster schedule columns from long vertical table rules."""
+- if not TESSERACT.is_file():return []
+- import numpy as np
+- pix=page.get_pixmap(matrix=pymupdf.Matrix(3,3),alpha=False)
+- rgb=np.frombuffer(pix.samples,dtype=np.uint8).reshape(pix.height,pix.width,pix.n)
+- gray=rgb[:,:,:3].mean(axis=2)
+- h,w=page.rect.height,page.rect.width
+- y0,y1=int(h*.50*3),min(pix.height,int(h*.95*3))
+- x0,x1=int(w*.18*3),int(w*.94*3)
+- density=(gray[y0:y1,x0:x1]<110).mean(axis=0)
+- peaks=np.where(density>.32)[0]+x0
+- runs=[]
+- for x in peaks:
+-  if not runs or x-runs[-1][-1]>5:runs.append([int(x)])
+-  else:runs[-1].append(int(x))
+- boundaries=[sum(run)/len(run)/3 for run in runs if len(run)>=2 and max(density[run[0]-x0:run[-1]-x0+1])>.60]
+- centers=[]
+- for left,right in zip(boundaries,boundaries[1:]):
+-  if 38<right-left<68:centers.append((left+right)/2)
+- # Random symbol strokes can look like a few vertical rules. Only publish a
+- # schedule hypothesis when a long, regularly spaced run of columns exists;
+- # otherwise leave the red-code position untouched for the normal recognizers.
+- if len(centers)<7:return []
+- gaps=np.diff(centers);median=float(np.median(gaps))
+- if median<=0 or np.max(np.abs(gaps-median))/median>.14:return []
+- return centers
+-
+-def outlined_schedule(page,words,lines):
+- """Recover a ruled denomination row from OCR plus vector cell borders.
+- No fixed paper size, rotation, row offset, or product-code dependent labels.
+- """
+- header=next((w for w in words if re.fullmatch(r'DENOMINAZIONE|DESCRIZIONE',w['text'],re.I) and w['box'][0]<page.rect.width*.3 and w['box'][1]>page.rect.height*.25),None)
+- if not header:return None
+- cy=(header['box'][1]+header['box'][3])/2
+- horizontal=sorted(set(round(a[1],2) for a,b in lines if abs(a[1]-b[1])<.3 and abs(a[0]-b[0])>page.rect.width*.45))
+- above=[y for y in horizontal if y<header['box'][1]];below=[y for y in horizontal if y>header['box'][3]]
+- if not above or not below:return None
+- top=max(above);bottom=min(below)
+- if not 8<bottom-top<60:return None
+- edges=sorted(set(round(a[0],2) for a,b in lines if abs(a[0]-b[0])<.3 and min(a[1],b[1])<=top+.8 and max(a[1],b[1])>=bottom-.8 and a[0]>header['box'][2]+3))
+- cells=[(a,b) for a,b in zip(edges,edges[1:]) if 25<b-a<page.rect.width*.2]
+- if len(cells)<3:return None
+- return {'top':top,'bottom':bottom,'cells':cells,'header':header['text']}
+-
+-
+-def refine_outlined_tokens(page,words,table,folder,index):
+- """Resolve small mixed alphanumeric label tokens with independent tight OCR.
+- Preserve baseline and both readings; accept only a nonempty exact agreement.
+- """
+- image=None;result=[]
+- for ordinal,word in enumerate(words):
+-  token=word['text'];x0,y0,x1,y1=word['box']
+-  eligible=table['top']<y0<table['bottom'] and x0>page.rect.width*.2 and bool(re.search(r'[A-Za-z]',token)) and bool(re.search(r'[0-9.]',token)) and len(token)<=24
+-  if not eligible:result.append(word);continue
+-  if image is None:
+-   pix=page.get_pixmap(matrix=pymupdf.Matrix(8,8),alpha=False);image=Image.frombytes('RGB',[pix.width,pix.height],pix.samples)
+-  target=folder/f'{index}_label_token_{ordinal}.png'
+-  image.crop(tuple(round(v*8) for v in (x0-1,y0-1,x1+1,y1+1))).convert('L').save(target)
+-  readings=[]
+-  for mode in (7,13):
+-   run=subprocess.run([str(TESSERACT),str(target),'stdout','--psm',str(mode),'-c','tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.'],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,creationflags=subprocess.CREATE_NO_WINDOW,timeout=15)
+-   readings.append(run.stdout.decode('utf-8',errors='replace').strip())
+-  agreed=bool(readings[0]) and readings[0]==readings[1]
+-  result.append({**word,'text':readings[0] if agreed else token,'originalText':token,'refinement':{'method':'8x tight word OCR; psm7 and psm13','readings':readings,'accepted':agreed}})
+- return result
+-
+-
+-def outlined_label(words,table,axis):
+- bounds=next(((a,b) for a,b in table['cells'] if a<axis<b),None)
+- if bounds is None:return '',None
+- a,b=bounds;selected=[w for w in words if a+1<(w['box'][0]+w['box'][2])/2<b-1 and table['top']+.5<(w['box'][1]+w['box'][3])/2<table['bottom']-.5]
+- selected.sort(key=lambda w:(round(w['box'][1]/4),w['box'][0]))
+- text=' '.join(w['text'].replace('_',' ') for w in selected).strip()
+- return text,{'source':'OCR bounded by vector table cell','box':[a,table['top'],b,table['bottom']],'words':selected,'text':text}
+-
+-
+-def read_cell(image,box,folder,key):
+- if not TESSERACT.is_file():return ''
+- x0,y0,x1,y1=box;crop=image.crop(tuple(round(v*4) for v in box)).convert('L')
+- if crop.width<8 or crop.height<8:return ''
+- import numpy as np
+- pixels=np.asarray(crop).copy();borders=(pixels<220).mean(axis=1)>.75;pixels[borders]=255;vertical=(pixels<220).mean(axis=0)>.85;pixels[:,vertical]=255;crop=Image.fromarray(np.pad(pixels,8,constant_values=255))
+- file=folder/(key+'.png');crop.save(file)
+- command=[str(TESSERACT),str(file),'stdout','--psm','6' if key.endswith('label') else '7']
+- if key.endswith('current'):command+=['-c','tessedit_char_whitelist=0123456789PpNnxX+/']
+- elif key.endswith('curve'):command+=['-c','tessedit_char_whitelist=0123456789BCD/']
+- elif key.endswith('ka'):command+=['-c','tessedit_char_whitelist=0123456789.,-']
+- result=subprocess.run(command,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,creationflags=subprocess.CREATE_NO_WINDOW,timeout=15)
+- return result.stdout.decode('utf-8',errors='replace').strip()
+-
+-def read_schedule_label(image,axis,half_width,heading_y,folder,key):
+- """OCR a full schedule denomination row, not a thin one-line crop.
+-
+- Raster schedules often wrap the circuit name over two lines. Keeping the
+- heading-based row bounds and comparing sparse/block OCR avoids reading only
+- the voltage printed in the row immediately below.
+- """
+- if image is None or not TESSERACT.is_file() or not heading_y:return {'text':'','readings':[]}
+- scale=4;x0=max(0,axis-half_width+1);x1=min(image.width/scale,axis+half_width-1)
+- # Denominations may occupy two printed lines below the heading. The former
+- # 14 pt crop consistently retained only "QUADRO" and lost "GENERALE".
+- y0=max(0,heading_y-16);y1=min(image.height/scale,heading_y+30)
+- crop=image.crop(tuple(round(v*scale) for v in (x0,y0,x1,y1))).convert('L')
+- if crop.width<18 or crop.height<20:return {'text':'','readings':[]}
+- import numpy as np
+- from PIL import ImageEnhance,ImageFilter
+- pix=np.asarray(crop).copy()
+- # Remove only the border rules touching the crop edges; retain letter strokes.
+- for edge in (0,1,-2,-1):
+-  if edge>=0:pix[edge,:]=255
+-  else:pix[edge,:]=255
+- crop=Image.fromarray(pix).resize((crop.width*3,crop.height*3),Image.Resampling.LANCZOS)
+- crop=ImageEnhance.Contrast(crop).enhance(1.6).filter(ImageFilter.MedianFilter(3))
+- file=folder/(key+'_full.png');crop.save(file)
+- readings=[]
+- for mode in (6,11,7):
+-  r=subprocess.run([str(TESSERACT),str(file),'stdout','--psm',str(mode)],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,creationflags=subprocess.CREATE_NO_WINDOW,timeout=15)
+-  raw=' '.join(r.stdout.decode('utf-8',errors='replace').split())
+-  # A schedule name is in its own ruled row; discard voltage leakage from the
+-  # following row without using switch ratings or labels as guessed values.
+-  cleaned=re.sub(r'\b(?:230|240|380|400|415)\b',' ',raw,flags=re.I)
+-  cleaned=' '.join(cleaned.split()).strip(' |_-:;')
+-  letters=len(re.findall(r'[A-Za-zÀ-ÿ]',cleaned));digits=len(re.findall(r'\d',cleaned))
+-  score=letters-2*digits+min(len(cleaned),40)*.02
+-  readings.append({'mode':mode,'raw':raw,'text':cleaned,'score':score})
+- token_rows=[]
+- for reading in readings:
+-  tokens=[re.sub(r'[^A-ZÀ-ÖØ-Þ0-9]','',word.upper()) for word in reading['text'].split()]
+-  token_rows.append([token for token in tokens if token])
+- votes=collections.Counter(token for row in token_rows[:2] for token in set(row))
+- consensus=[]
+- for token in token_rows[0]:
+-  if votes[token]>=2 and token not in consensus:consensus.append(token)
+- consensus_text=' '.join(consensus)
+- score=sum(len(token) for token in consensus if len(token)>1)
+- # Do not promote a long but unstable OCR hallucination to a circuit label.
+- return {'text':consensus_text if score>=4 else '', 'readings':readings,'score':score}
+-
+-def raster_bus_evidence(page,nodes):
+- """Trace continuous raster rails and report which device axes they cross."""
+- if len(nodes)<3:return None
+- pix=page.get_pixmap(matrix=pymupdf.Matrix(3,3),alpha=False)
+- rgb=Image.frombytes('RGB',[pix.width,pix.height],pix.samples).convert('L')
+- import numpy as np
+- ink=np.asarray(rgb)<110;h,w=ink.shape;page_h=page.rect.height;page_w=page.rect.width
+- valid=[n for n in nodes if 2<float(n.get('evidence',{}).get('axis',-1))<page_w-2]
+- if len(valid)<3:return None
+- candidates=[]
+- for ypt in np.arange(page_h*.095,page_h*.16,.75):
+-  y=round(ypt*3)
+-  xlo=round(page_w*.10*3);xhi=round(page_w*.94*3)
+-  # The raster may be skewed a few pixels across the sheet. Use a narrow
+-  # vertical tolerance band so the bus survives mild scan rotation without
+-  # bridging genuinely separate same-height rails.
+-  row=ink[max(0,y-4):min(h,y+5),xlo:xhi]
+-  projection=row.mean(axis=0)>.18
+-  runs=[];start=None
+-  for index,value in enumerate(np.r_[projection,False]):
+-   if value and start is None:start=index
+-   elif not value and start is not None:
+-    if index-start>=24:runs.append([start,index])
+-    start=None
+-  # Raster noise and symbols create small breaks in a real bus. Bridge at
+-  # most 8 pt; larger gaps remain distinct electrical nets.
+-  merged=[]
+-  for a,b in runs:
+-   if merged and a-merged[-1][1]<=24:merged[-1][1]=b
+-   else:merged.append([a,b])
+-  segments=[]
+-  for a,b in merged:
+-   lo=(xlo+a)/3;hi=(xlo+b)/3;crossed=[]
+-   for n in valid:
+-    axis=float(n['evidence']['axis'])
+-    px=round(axis*3)
+-    sample=ink[max(0,y-4):min(h,y+5),max(0,px-2):min(w,px+3)]
+-    if lo-12<=axis<=hi+12 and sample.sum()>=4:crossed.append(n['id'])
+-   if hi-lo>=8:segments.append({'x0':round(lo,2),'x1':round(hi,2),'devices':crossed,'length':round(hi-lo,2)})
+-  support=len({ident for s in segments for ident in s['devices']})
+-  if support>=2:candidates.append({'y':round(ypt,2),'segments':segments,'support':support})
+- if not candidates:return None
+- best=max(candidates,key=lambda q:(q['support'],sum(s['length'] for s in q['segments'] if s['devices'])))
+- return {'y':best['y'],'axisSupport':round(best['support']/len(valid),3),'segments':best['segments'],'source':'raster_horizontal_bus_segments','status':'proposed'}
+-
+-def make_scan_previews(doc,nodes,folder,topology,page_indices=None):
+- """Create lightweight page rasters plus vector coordinates for the scan inspector."""
+- pages=[];proposals=(topology or {}).get('rasterProposals',[])
+- try:base='/'+folder.resolve().relative_to(ROOT.resolve()).as_posix()
+- except ValueError:return pages
+- for index in (range(len(doc)) if page_indices is None else page_indices):
+-  page=doc[index]
+-  image_name=f'scan_page_{index+1}.png'
+-  if not (folder/image_name).is_file():
+-   pix=page.get_pixmap(matrix=pymupdf.Matrix(1.35,1.35),alpha=False);pix.save(folder/image_name)
+-  page_nodes=[n for n in nodes if int(n.get('evidence',{}).get('page',0))==index+1]
+-  proposal=next((x for x in proposals if x.get('page')==index+1),None);bus=proposal.get('bus') if proposal else None
+-  pages.append({'page':index+1,'image':base+'/'+image_name,'width':round(page.rect.width,2),'height':round(page.rect.height,2),
+-   'nodes':[{'id':n['id'],'sigla':n['sigla'],'label':n.get('label',''),'article':n.get('values',{}).get('articolo',''),
+-    'axis':n.get('evidence',{}).get('axis'),'articleBox':n.get('evidence',{}).get('articleBox'),
+-    'labelBox':n.get('evidence',{}).get('labelBox') or n.get('evidence',{}).get('scheduleCell'),
+-    'labelStatus':n.get('fieldReview',{}).get('utenza',{}).get('status','proposed'),
+-    'cableReadings':n.get('evidence',{}).get('cableReadings',[]),
+-    'connection':n.get('connectionReview',{}),'parent':n.get('parent')} for n in page_nodes],
+-   'wireNetworks':next((r.get('trace',{}).get('wireNetworks',[]) for r in (topology or {}).get('pageTraces',[]) if r.get('page')==index+1),[]),
+-   'bus':bus,'topologyProposal':proposal,'sourceGroup':next((n.get('values',{}).get('externalSupplyGroup') for n in page_nodes if n.get('values',{}).get('externalSupplyGroup')),None),
+-   'issues':[{'node':n['sigla'],'message':w} for n in page_nodes for w in n.get('warnings',[]) if any(k in w.lower() for k in ('alimentaz','collegamento','utenza','verificare'))]})
+- return pages
+-
+-def refine_page_references(page,words,folder,index):
+- result=[];image=None
+- for ordinal,word in enumerate(words):
+-  if re.fullmatch(r'PAG\.?\s*[A-Z]\.?',word['text'],re.I):
+-   if image is None:
+-    pix=page.get_pixmap(matrix=pymupdf.Matrix(8,8),alpha=False);image=Image.frombytes('RGB',[pix.width,pix.height],pix.samples)
+-   x0,y0,x1,y1=word['box']
+-   file=folder/f'{index}_{ordinal}_PAG_ref.png';image.crop(tuple(round(v*8) for v in [x0-2,y0-2,x1+2,y1+2])).save(file)
+-   readings=[]
+-   for mode,whitelist in [(7,'0123456789.PAG'),(13,None)]:
+-    command=[str(TESSERACT),str(file),'stdout','--psm',str(mode)]
+-    if whitelist:command+=['-c','tessedit_char_whitelist='+whitelist]
+-    read=subprocess.run(command,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,creationflags=subprocess.CREATE_NO_WINDOW,timeout=15)
+-    match=re.fullmatch(r'PAG\.?\s*(\d{1,3})\.?',read.stdout.decode('utf-8',errors='replace').strip(),re.I)
+-    readings.append(match[1] if match else None)
+-   if readings[0] and readings[0]==readings[1]:word={**word,'originalText':word['text'],'text':'PAG.'+readings[0],'refinement':'8x crop; psm7 and psm13 agree'}
+-  result.append(word)
+- return result
+-
+-def formation_proposals(folder,key,baseline=None):
+- """Tight OCR of a cable cell; preserve disagreements instead of accepting 9G."""
+- file=folder/(key+'.png')
+- if not file.is_file() or not TESSERACT.is_file():return None,[],{}
+- image=Image.open(file).convert('L');box=image.point(lambda p:255-p).getbbox()
+- if not box:return None,[],{}
+- crop=image.crop(box);padded=Image.new('L',(crop.width+32,crop.height+32),255);padded.paste(crop,(16,16));padded=padded.resize((padded.width*3,padded.height*3));target=folder/(key+'_tight.png');padded.save(target)
+- readings={'confidence':{}};candidates=set()
+- if baseline:
+-  original=str(baseline).strip().replace(',','.').replace(' ','').upper()
+-  readings['cell']=original
+-  if re.fullmatch(r'\d{1,2}G\d+(?:\.\d+)?',original):candidates.add(original)
+- for mode in [6,7,13]:
+-  run=subprocess.run([str(TESSERACT),str(target),'stdout','--psm',str(mode),'tsv'],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,creationflags=subprocess.CREATE_NO_WINDOW,timeout=15)
+-  tokens=[r for r in csv.DictReader(io.StringIO(run.stdout.decode('utf-8',errors='replace')),delimiter='\t') if r.get('text','').strip()]
+-  text=''.join(r['text'] for r in tokens).strip().replace(',','.').replace(' ','').upper();readings['psm'+str(mode)]=text
+-  readings['confidence']['psm'+str(mode)]=min((float(r['conf']) for r in tokens),default=0)
+-  if re.fullmatch(r'\d{1,2}G\d+(?:\.\d+)?',text,re.I):candidates.add(text.upper())
+-  # A numeric-shaped G is only an alternate hypothesis, never a silent repair.
+-  alternate=re.fullmatch(r'([1-9])[6C](\d+\.\d+)',text,re.I)
+-  if alternate:candidates.add(alternate[1]+'G'+alternate[2])
+- ordered=sorted(candidates)
+- agreed=len(ordered)==1 and sum(readings.get('psm'+str(mode))==ordered[0] and readings['confidence']['psm'+str(mode)]>=70 for mode in [6,7,13])>=2
+- readings['accepted']=agreed
+- return (ordered[0] if agreed else None),ordered,readings
+-
+-def feeder_proposals(nodes,lines,width,height):
+- # Trace only long, continuous orthogonal conductors above the table.
+- wires=[(a,b) for a,b in lines if max(a[1],b[1])<height*.60 and min(a[0],b[0])>width*.16 and abs(a[0]-b[0])+abs(a[1]-b[1])>=10]
+- graph=collections.defaultdict(set)
+- def key(p):return (round(p[0]*2)/2,round(p[1]*2)/2)
+- def on(p,a,b):return min(a[0],b[0])-.6<=p[0]<=max(a[0],b[0])+.6 and min(a[1],b[1])-.6<=p[1]<=max(a[1],b[1])+.6
+- for a,b in wires:
+-  points=[a,b]
+-  for c,d in wires:
+-   if abs(a[1]-b[1])<.3 and abs(c[0]-d[0])<.3:p=(c[0],a[1])
+-   elif abs(a[0]-b[0])<.3 and abs(c[1]-d[1])<.3:p=(a[0],c[1])
+-   else:
+-    points.extend(p for p in (c,d) if on(p,a,b));continue
+-   if on(p,a,b) and on(p,c,d):points.append(p)
+-  points=sorted(set(key(p) for p in points),key=lambda p:p[0] if abs(a[1]-b[1])<.3 else p[1])
+-  for p,q in zip(points,points[1:]):graph[p].add(q);graph[q].add(p)
+- components={};index=0
+- for point in graph:
+-  if point in components:continue
+-  index+=1;stack=[point]
+-  while stack:
+-   p=stack.pop()
+-   if p in components:continue
+-   components[p]=index;stack.extend(graph[p])
+- def component(p):
+-  q=min(components,key=lambda q:abs(q[0]-p[0])+abs(q[1]-p[1]),default=None)
+-  return components[q] if q and abs(q[0]-p[0])+abs(q[1]-p[1])<1.5 else None
+- for n in nodes:
+-  x=n['evidence']['axis'];cy=n['evidence']['articleBox'][1]
+-  vertical=[(a,b) for a,b in wires if abs(a[0]-x)<1.2 and abs(b[0]-x)<1.2]
+-  above=[(a,b) for a,b in vertical if max(a[1],b[1])<=cy+3]
+-  below=[(a,b) for a,b in vertical if min(a[1],b[1])>cy+3]
+-  n['_in']=component(min(above,key=lambda ab:cy-max(ab[0][1],ab[1][1]))[0]) if above else None
+-  n['_out']=component(min(below,key=lambda ab:min(ab[0][1],ab[1][1]))[0]) if below else None
+- for n in nodes:
+-  parents=[p for p in nodes if p['id']!=n['id'] and p.get('_out') and p['_out']==n.get('_in')]
+-  if len(parents)==1:
+-   n['parent']=parents[0]['id'];n['connectionStatus']='proposta_da_linee_vettoriali';n['warnings'].append('Alimentazione proposta da continuità delle linee PDF: confermare.')
+-  else:
+-   n['connectionStatus']='da_definire';n['warnings'].append('Alimentazione non determinata: scegliere il padre o confermare ingresso esterno.')
+- for n in nodes:n.pop('_in',None);n.pop('_out',None)
+-
+-def breaker_columns_without_codes(page,folder,index,settings,counts,url,words=None):
+- """Find typed breaker columns in a summary table, not arbitrary OCR numbers."""
+- words=words if words is not None else raster_spans(page,folder,index,False);anchors=[w for w in words if w['text'].upper() in ['SCATOLATO','MODULARE'] and page.rect.height*.35<w['box'][1]<page.rect.height*.8];nodes=[]
+- image=None
+- if anchors:
+-  pix=page.get_pixmap(matrix=pymupdf.Matrix(4,4),alpha=False);image=Image.frombytes('RGB',[pix.width,pix.height],pix.samples)
+- for anchor in anchors:
+-  x=(anchor['box'][0]+anchor['box'][2])/2;y=(anchor['box'][1]+anchor['box'][3])/2
+-  near=[w for w in words if abs((w['box'][0]+w['box'][2])/2-x)<45 and y+5<(w['box'][1]+w['box'][3])/2<y+16]
+-  nominal_words=sorted(near,key=lambda w:w['box'][0]);numeric=[w for w in nominal_words if re.fullmatch(r'\d+(?:\+N)?',w['text'],re.I)]
+-  if len(numeric)<2:continue
+-  raw_poles=numeric[0]['text'].upper();current=int(numeric[1]['text'])
+-  if raw_poles not in ['1','2','3','4','1+N','3+N'] or not 1<=current<=4000:continue
+-  poles={'1+N':'1P+N','3+N':'4P'}.get(raw_poles,raw_poles+'P')
+-  columns=sorted((a['box'][0]+a['box'][2])/2 for a in anchors);half=min([abs(b-a)/2 for a,b in zip(columns,columns[1:])],default=55)
+-  # A breaker column may be separated from the next by instrument columns.
+-  # Recover its own half-width from the N.POLI cell center, not that large gap.
+-  pole_center=(numeric[0]['box'][0]+numeric[0]['box'][2])/2
+-  cell_half=2*abs(x-pole_center)
+-  if not 20<=cell_half<=60:cell_half=min(half,45)
+-  denom=next((w for w in words if w['text'].upper()=='DENOMINAZIONE'),None);label='Utenza da leggere'
+-  if denom:
+-   ly=denom['box'][1];namewords=[w for w in words if abs((w['box'][0]+w['box'][2])/2-x)<half and ly-8<w['box'][1]<ly+16]
+-   label=' '.join(w['text'] for w in sorted(namewords,key=lambda w:(round(w['box'][1]/4),w['box'][0]))) or label
+-  counts['POWER']+=1;sigla='QF'+str(counts['POWER'])
+-  def field(a,b,offset,key):
+-   return read_cell(image,(a,y+offset-3.7,b,y+offset+3.7),folder,f'{index}_{sigla}_{key}')
+-  # This table has Ith / Idn / class on one row and Im / Pdi on the next.
+-  idn_raw=field(x,x+cell_half/2,19.7,'idn');dtype_raw=field(x+cell_half/2,x+cell_half,19.7,'dtype')
+-  curve_raw=field(x-cell_half,x,29.4,'curve_full');ka_raw=field(x,x+cell_half,29.4,'ka')
+-  dtype=dtype_raw.strip(' \t\n\"\'“”‘’').upper()
+-  if dtype not in ['AC','A','F','B']:dtype=''
+-  adjustable=bool(re.fullmatch(r'REG\.?',idn_raw.strip(),re.I))
+-  diff_value=re.fullmatch(r'0[.,](\d+)',idn_raw.strip())
+-  diff_mA=round(float(idn_raw.replace(',','.'))*1000) if diff_value else None
+-  kind='MTD' if adjustable or diff_mA else 'MT'
+-  nominal_raw=' '.join(w['text'] for w in nominal_words)
+-  setting_match=re.search(r'\bR\s*(\d+)\b',nominal_raw,re.I)
+-  setting=int(setting_match[1]) if setting_match else None
+-  curve=curve_raw.strip().upper()
+-  duplicate_curve=re.fullmatch(r'([BCD])\1',curve)
+-  if duplicate_curve:curve=duplicate_curve[1]
+-  magnetic_ocr=re.fullmatch(r'INX[I1]0',curve)
+-  if magnetic_ocr:curve='Inx10'
+-  request={'kind':kind,'poles':poles,'current':current,'curve':curve if curve in ['B','C','D'] else None,'label':label}
+-  if kind=='MTD':request.update(diff_mA=diff_mA or 30,diff_type=dtype or 'UNKNOWN',diff_adjustable=adjustable)
+-  if setting is not None:request['setting_current']=setting
+-  warnings=['Apparecchio individuato dalla colonna del progetto; simbolo da verificare.','Articolo proposto senza codice rosso, non confermato.','Alimentazioni e rimandi tra pagine da ricostruire.']
+-  values={'taratura':poles+'/'+str(current)+'A'+(f' [{setting}A]' if setting is not None else ''),'utenza':label}
+-  if adjustable or diff_mA:values['differenziale']=(dtype+'/' if dtype else '')+('REG' if adjustable else f'{diff_mA/1000:g}A')
+-  if curve:values['curva_Im']=curve
+-  if re.fullmatch(r'\d+(?:[.,]\d+)?',ka_raw.strip()):values['project_pdi_kA']=ka_raw.strip()
+-  protection={'function':kind,'construction':anchor['text'],'nominalA':current,'settingA':setting,'diffAdjustable':adjustable,'diff_mA':diff_mA,'diffType':dtype or None}
+-  articles=[]
+-  selection={};selection_error=False
+-  try:
+-   proposed=select_device(request,settings)['chosen'];original=dict(values);values.update(proposed['values']);values.update(original);articles=proposed['articles'];warnings+=proposed['warnings']
+-   selection_error=proposed.get('requiresTechnicalReview',False)
+-   selection={key:proposed[key] for key in ['required_kA','rated_kA','basis','voltage','description','source','requiresTechnicalReview']}
+-  except ValueError as e:
+-   warnings.append(str(e));selection_error=True
+-   if kind=='MTD':
+-    try:
+-     base=select_device({**request,'kind':'MT'},settings)['chosen'];original=dict(values);values.update(base['values']);values.update(original);articles=base['articles'];selection={key:base[key] for key in ['required_kA','rated_kA','basis','voltage','description','source']}
+-     warnings.append('Solo base magnetotermica proposta: il gruppo differenziale è incompleto e il definitivo resta bloccato.')
+-    except ValueError:pass
+-  if duplicate_curve:warnings.append('Lettera curva duplicata nell\'OCR: normalizzata a '+curve+', originale conservato nelle evidenze.')
+-  if magnetic_ocr and curve_raw.strip().upper()!='INX10':warnings.append('Moltiplicatore magnetico proposto come Inx10 da OCR; controllare il campo originale, conservato nelle evidenze.')
+-  nodes.append({'id':uuid.uuid4().hex[:12],'sigla':sigla,'kind':kind,'label':label,'articles':articles,'values':values,'protection':protection,'request':request,'selectionError':selection_error,**selection,'parent':None,'confirmed':False,'connectionConfirmed':False,'warnings':warnings,'connectionStatus':'da_definire','x':40,'y':40,'imported':True,'evidence':{'page':index+1,'articleBox':anchor['box'],'axis':x,'articleSource':'proposta catalogo da tabella OCR','labelSource':'OCR tabella','catalogueDescription':'Scatolato/modulare da progetto: '+anchor['text'],'pdf':url,'rawCells':{'nominal':nominal_raw,'idn':idn_raw,'dtype':dtype_raw,'curve':curve_raw,'ka':ka_raw}}})
+- return nodes
+-
+-def interpret(raw,name,settings,folder,url,progress=None):
+- def update(phase,percent,message,**details):
+-  if progress:progress({'phase':phase,'percent':int(percent),'message':message,**details})
+- live_pages={}
+- def publish_page(index,nodes,notes,phase,percent,message,topology=None):
+-  if not progress:return
+-  preview=make_scan_previews(doc,nodes,folder,topology,[index])
+-  if not preview:raise ValueError('Impossibile pubblicare anteprima: cartella esterna agli output del programma.')
+-  item=preview[0];item['phase']=phase
+-  item['redAnnotations']=[{'text':note['text'],'box':note['bbox'],'catalogueMatch':note['catalogueMatch']} for note in notes if note['page']==index+1]
+-  live_pages[index]=item
+-  update(phase,percent,message,previewPages=list(live_pages.values()),currentPage=index+1,totalPages=len(doc),nodesDetected=len(nodes))
+- update('apertura',2,'Apro il PDF e controllo le pagine.')
+- doc=pymupdf.open(stream=raw,filetype='pdf')
+- if len(doc)>150:raise ValueError('Limite alpha: 150 pagine PDF.')
+- if len(doc):publish_page(0,[],[],'lettura',3,'Documento aperto: visualizzo la prima pagina mentre controllo i requisiti.')
+- settings=dict(settings);initial_settings=dict(settings);word_cache={};requirements=None
+- # Board requirements must be known before choosing the first breaker family.
+- for index in range(min(3,len(doc))):
+-  update('requisiti',4+3*index,'Verifico i requisiti generali prima di classificare gli apparecchi.')
+-  words=spans(doc[index]);req=extract_requirements(words,index+1)
+-  if req is None:
+-   words=raster_spans(doc[index],folder,index,False);word_cache[index]=words
+-   req=extract_requirements(words,index+1)
+-  if req:
+-   requirements=req;settings=apply_requirements(req,settings);break
+- red_vision={}
+- nodes=[];notes=[];messages=[];counts=collections.Counter();topology_records=[];unresolved_components=[];equipment_candidates=[];protective_networks=[];measurement_assemblies=[]
+- for page_index,page in enumerate(doc):
+-  publish_page(page_index,nodes,notes,'lettura',8+60*page_index/max(1,len(doc)),f'Pagina {page_index+1}/{len(doc)} · separo annotazioni, etichette e tratti grafici.')
+-  protective_networks.extend(protective_earth_from_page(page,page_index+1))
+-  ss=spans(page);w,h=page.rect.width,page.rect.height;lines=vector_lines(page)
+-  if not any(s['color']==0xff0000 for s in ss):
+-   # Articoli rossi solo raster: ritagli rossi -> OCR -> Claude vision sui soli dubbi -> listino.
+-   red_spans=rossi_vision.leggi_pagina(page,TESSERACT,statistiche=red_vision.setdefault(page_index+1,{}))
+-   ss+=red_spans or raster_spans(page,folder,page_index,red_only=True)
+-  unresolved_components.extend(collect_components(ss,page_index+1))
+-  headers=[s for s in ss if re.fullmatch(r'[1-9]\d?',s['text']) and s['box'][1]<h*.15 and s['box'][0]>w*.17]
+-  axes=sorted(set(round((s['box'][0]+s['box'][2])/2,1) for s in headers))
+-  codes=[];accessories=[]
+-  for s in ss:
+-   color=s['color'];red=((color>>16)&255)>150 and ((color>>8)&255)<100 and (color&255)<100
+-   if not red:continue
+-   mentioned=re.findall(r'\b[A-Z][A-Z0-9]{4,15}(?:/[A-Z0-9]+)?\b',s['text'].upper())
+-   matched=[a for a in mentioned if a in CAT or a in STANDARD_COMPONENTS]
+-   notes.append({'page':page_index+1,'text':s['text'],'bbox':s['box'],'catalogueMatch':bool(matched),'catalogueArticles':matched,'unmatchedArticles':[a for a in mentioned if a not in CAT and a not in STANDARD_COMPONENTS]})
+-   for article in re.findall(r'\b[A-Z][A-Z0-9]{4,15}(?:/[A-Z0-9]+)?\b',s['text'].upper()):
+-    if article in CAT:
+-     kind=classify(CAT[article]['descrizione'])
+-     if kind in ['MT','MTD','RCD','QS']:codes.append((article,s))
+-     elif kind=='MOD_DIFF':accessories.append((article,s))
+-  # Le annotazioni FreeText non compaiono in spans(): entrano come note da verificare, mai come apparecchi confermati.
+-  for ann in annotation_articles(page):
+-   missing=[{'article':v['codice'],'suggestions':v['suggerimenti']} for v in ann['verifiche'] if not v['esiste']]
+-   notes.append({'page':page_index+1,'text':ann['testo'],'bbox':ann['rect'],'source':'annotazione','catalogueMatch':not missing,'catalogueArticles':[v['codice'] for v in ann['verifiche'] if v['esiste']],'unmatchedArticles':[m['article'] for m in missing],'toConfirm':missing,'kinds':ann['tipi'],'breakerWithRcd':ann['unita_mt_diff']})
+-  publish_page(page_index,nodes,notes,'codici',10+60*page_index/max(1,len(doc)),f'Pagina {page_index+1}/{len(doc)} · annotazioni rosse individuate; associo gli apparecchi.')
+-  unknown={(p['article'],tuple(p['span']['box'])):p for p in unknown_switches(page,ss,axes)}
+-  codes.extend((p['article'],p['span']) for p in unknown.values())
+-  image=None;page_nodes=[];groups=collections.defaultdict(list);axis_evidence={};contact_edges=switch_segments(page) if codes else []
+-  for article,s in codes:
+-   center=(s['box'][0]+s['box'][2])/2;axis=min(axes,key=lambda x:abs(x-center)) if axes else center
+-   if (article in CAT and classify(CAT[article]['descrizione'])=='QS') or (article,tuple(s['box'])) in unknown:
+-    geometry=locate_switch(page,axes,s['box'],contact_edges)
+-    if geometry:
+-     axis=geometry['axis'];axis_evidence[(article,tuple(s['box']))]=geometry
+-   groups[axis].append((article,s))
+-  schedule_centers=schedule_column_centers(page) if groups else [];snap_evidence={}
+-  if len(schedule_centers)>=4:
+-   remapped=collections.defaultdict(list)
+-   for axis,group in groups.items():
+-    center=min(schedule_centers,key=lambda x:abs(x-axis))
+-    if abs(center-axis)<=36:
+-     remapped[center].extend(group);snap_evidence[center]=axis
+-    else:remapped[axis].extend(group)
+-   groups=remapped;axes=sorted(groups)
+-  # Red article callouts can be real PDF text while the circuit schedule itself
+-  # is a single embedded scan. In that mixed case, OCR only the compact label
+-  # area first; previously we looked exclusively at native text, so a perfectly
+-  # legible raster schedule silently produced empty fields for every feeder.
+-  raster_schedule=len(schedule_centers)>=7
+-  table_words=ss
+-  label_tokens=('denominazione','curva','poli','formazione','lung')
+-  native_labels=any(any(token in s['text'].lower() for token in label_tokens) and s['box'][0]<w*.2 and s['box'][1]>h*.35 for s in ss)
+-  if groups and not native_labels and TESSERACT.is_file():
+-   raster_words=word_cache.get(page_index)
+-   if raster_words is None:
+-    raster_words=raster_spans(page,folder,page_index,False);word_cache[page_index]=raster_words
+-   table_words=ss+raster_words
+-  outline_table=outlined_schedule(page,table_words,lines) if groups and not native_labels and not raster_schedule else None
+-  if outline_table:
+-   table_words=refine_outlined_tokens(page,table_words,outline_table,folder,page_index)
+-   remapped=collections.defaultdict(list)
+-   for axis,group in groups.items():
+-    labelled_cells=[(a,b) for a,b in outline_table['cells'] if len(re.findall(r'[A-Za-zÀ-ÿ]',outlined_label(table_words,outline_table,(a+b)/2)[0]))>=4]
+-    cell_bounds=min(labelled_cells,key=lambda bounds:abs(sum(bounds)/2-axis),default=None)
+-    center=sum(cell_bounds)/2 if cell_bounds and abs(sum(cell_bounds)/2-axis)<(cell_bounds[1]-cell_bounds[0])*.8 else axis
+-    remapped[center].extend(group)
+-   groups=remapped;axes=sorted(groups)
+-  row=lambda token:next(((s['box'][1]+s['box'][3])/2 for s in table_words if token.lower() in s['text'].lower() and s['box'][0]<w*.2),None)
+-  # Schedule headings describe the row ABOVE its values. Use the table's
+-  # circuit-name heading rather than a cover/header occurrence of “Descrizione”.
+-  if raster_schedule:
+-   description_y=row('Denominazione') or row('Descrizione');current_y=row('Poli x In') or row('Curva')
+-   curve_y=row('Curva/Sganciatori') or row('Curva');ka_y=row('P.D.I.') or row('Pdi')
+-   voltage_y=row('Vn (V)') or row('V (V)');formation_y=row('Formazione');length_y=row('Lunghezza') or row('Lung.')
+-   idn_y=row('Soglia Id') or row('In (A)');delay_y=row('Ritardo') or row('TAR At')
+-   # This raster schedule labels each ruled row above its values.
+-   description_y=description_y+8 if description_y is not None else None
+-   current_y=current_y+8 if current_y is not None else None
+-   curve_y=curve_y+8 if curve_y is not None else None
+-   ka_y=ka_y+8 if ka_y is not None else None
+-   voltage_y=voltage_y+8 if voltage_y is not None else None
+-   formation_y=formation_y+8 if formation_y is not None else None
+-   length_y=length_y+8 if length_y is not None else None
+-   idn_y=idn_y+8 if idn_y is not None else None
+-   delay_y=delay_y+8 if delay_y is not None else None
+-  else:
+-   description_y=(outline_table['top']+outline_table['bottom'])/2 if outline_table else row('Descrizione');current_y=row('Poli x In');curve_y=row('Curva/Sganciatori');ka_y=row('P.D.I.')
+-   voltage_y=row('Vn (V)');formation_y=row('Formazione');length_y=row('Lunghezza');idn_y=row('Soglia Id');delay_y=row('Ritardo')
+-  cable_y=next(((s['box'][1]+s['box'][3])/2 for s in ss if s['text']=='Tipo' and s['box'][0]<w*.2 and s['box'][1]>h*.85),None)
+-  class_y=next(((s['box'][1]+s['box'][3])/2 for s in ss if s['text']=='Classe' and idn_y and idn_y<s['box'][1]<idn_y+25),None)
+-  if groups and description_y and TESSERACT.is_file():
+-   pix=page.get_pixmap(matrix=pymupdf.Matrix(4,4),alpha=False);image=Image.frombytes('RGB',[pix.width,pix.height],pix.samples)
+-  for axis,group in sorted(groups.items()):
+-   article,s=group[0];unknown_key=(article,tuple(s['box']));unlisted=unknown_key in unknown
+-   product=specs(article,CAT[article]) if not unlisted else {'kind':'QS','current':None,'description':'Articolo non presente nel catalogo; funzione proposta da contatto aperto del progetto','diff_mA':None}
+-   kind=product['kind'];prefix='QS' if kind=='QS' else 'QF';counts['POWER']+=1;sigla=prefix+str(counts['POWER']);label='Utenza da leggere';v={'articolo':article,'costruttore':'BTICINO'};warnings=['Sigla provvisoria generata con numerazione comune QS/QF; verificare quella del progetto.','Funzione identificata dal codice articolo rosso; confermare anche il simbolo.']
+-   if unlisted:warnings[-1]='Funzione QS proposta dalla geometria del progetto, articolo sconosciuto conservato: verificare funzione e codice.'
+-   span=min([abs(b-a) for a,b in zip(axes,axes[1:])],default=70)/2-2
+-   def cell(y,half,key):return read_cell(image,(max(0,axis-span),max(0,y-half),min(w,axis-1 if key in ['voltage','cable'] else axis+span),min(h,y+half)),folder,f'{page_index}_{sigla}_{key}') if image and y else ''
+-   label_raw='';label_review=None;label_ocr=None
+-   if description_y:
+-    if raster_schedule:
+-     label_ocr=read_schedule_label(image,axis,span,description_y,folder,f'{page_index}_{sigla}_label')
+-     label_raw=label_ocr.get('text','') or ' / '.join(r['raw'] for r in label_ocr.get('readings',[]) if r.get('raw'))
+-    else:label_raw=' '.join(cell(description_y+4,4.5,'label').split())
+-    candidate=re.split(r'\s*\|\s*',label_raw,1)[0].strip(' _-:;')
+-    candidate=re.split(r'\b(?:230|240|380|400|415)\b',candidate,1)[0].strip(' _-:;')
+-    if raster_schedule:
+-     letters=len(re.findall(r'[A-Za-zÀ-ÿ]',candidate))
+-     if letters>=4 and label_ocr and label_ocr.get('score',0)>=4:
+-      label=candidate
+-      label_review={'status':'proposed','raw':label_raw,'readings':label_ocr.get('readings',[]),'reason':'Denominazione OCR proposta: verificare sul PDF originale'}
+-     else:
+-      label='Utenza da verificare'
+-      if label_raw:label_review={'status':'ambiguous','raw':label_raw,'readings':label_ocr.get('readings',[]) if label_ocr else [],'reason':'OCR da tabella raster non sufficientemente affidabile'}
+-    elif len(re.findall(r'[A-Za-zÀ-ÿ]',candidate))>=4 and '\ufffd' not in candidate:label=candidate
+-   if outline_table:
+-    label_raw,label_ocr=outlined_label(table_words,outline_table,axis)
+-    if len(re.findall(r'[A-Za-zÀ-ÿ]',label_raw))>=4:
+-     label=label_raw
+-     label_review={'status':'proposed','raw':label_raw,'reason':'OCR della cella delimitata da bordi vettoriali; verificare la denominazione sul PDF.'}
+-   current=cell(current_y,3.7,'current').replace(' ','');match=re.search(r'(3P\+N|4P|1P\+N|2P|P\+N|3P|1P)[xX×/]?(\d+)',current,re.I)
+-   if match:
+-    poles={'3P+N':'4P','P+N':'1P+N'}.get(match[1].upper(),match[1].upper());amps=int(match[2]);v['taratura_progetto_letta']=poles+'/'+str(amps)+'A'
+-    spec=conductor_spec(current)
+-    if spec:v['conductorSpec']=spec
+-   else:
+-    v['taratura']=''
+-    if product.get('current') is None:warnings.append('Poli e corrente non ricavabili dall’articolo rosso: completarli prima del DWG.')
+-   curve=cell(curve_y,3.7,'curve');curve_match=re.fullmatch(r'([BCD])(?:/)?\d*',curve.strip());v['curva_Im']=''
+-   # Never turn a stray scan token (often the breaker current from an adjacent
+-   # row) into a curve or a kA rating. The red article supplies the selected
+-   # device data; unresolved catalogue fields remain blank and are reviewed.
+-   ka=cell(ka_y,3.7,'ka');v['potere_interruzione']='';raw_voltage=cell(voltage_y,3.7,'voltage');volt=re.search(r'\b(230|400|240|380|415)\b',raw_voltage);v['tensione']=volt[1]+'V' if volt else ''
+-   cable=cell(cable_y,3.7,'cable');formation=cell(formation_y,3.7,'formation');length=cell(length_y,3.7,'length');field_review={'utenza':label_review} if label_review else {}
+-   if ka.strip():field_review['potere_interruzione']={'status':'ambiguous','raw':ka,'reason':'lettura OCR tabellare non usata come dato di targa'}
+-   if curve.strip() and not product.get('curve'):field_review['curva_Im']={'status':'ambiguous','raw':curve,'reason':'dato dell’interruttore non disponibile nel codice rosso/catalogo; OCR nero non usato come fonte'}
+-   cable_token=re.search(r'\bFG[A-Z0-9()]+',cable.upper())
+-   if cable_token:
+-    candidate=cable_token[0].replace('FGI','FG1').replace('160M','16OM');v['tipo_cavo']=candidate
+-    if candidate!=cable_token[0]:warnings.append('Tipo cavo proposto con normalizzazione OCR: controllare il testo originale.')
+-   if formation:
+-    proposed,alternatives,formation_reads=formation_proposals(folder,f'{page_index}_{sigla}_formation',formation)
+-    if proposed:v['composizione_cavo']=proposed
+-    else:
+-     preview_file=(folder/f'{page_index}_{sigla}_formation.png').resolve();preview=None
+-     if preview_file.is_relative_to(ROOT.resolve()):preview='/'+preview_file.relative_to(ROOT.resolve()).as_posix()
+-     elif preview_file.is_relative_to(STUDIO.resolve()):preview='/assets/'+preview_file.relative_to(STUDIO.resolve()).as_posix()
+-     field_review['composizione_cavo']={'status':'ambiguous','alternatives':alternatives,'raw':formation,'readings':formation_reads,'preview':preview}
+-     warnings.append('Formazione cavo da verificare: '+(', '.join(alternatives) or 'nessuna lettura affidabile')+'. Controllare il dettaglio e compilare il dato.')
+-   if re.fullmatch(r'\d+(?:[.,]\d+)?',length.strip()):v['lunghezza_m']=length.strip()
+-   idn=cell(idn_y,3.7,'idn');dtype=cell(class_y,3.7,'dtype');delay=cell(delay_y,3.7,'delay')
+-   if dtype.strip() in ['A','AC','F','B'] and re.fullmatch(r'\d+',idn.strip()):
+-    v['differenziale']=dtype.strip()+'/'+f'{int(idn)/1000:g}'+('/IST.' if delay.strip()=='0' else '')
+-   v['utenza']=label
+-   ident=uuid.uuid4().hex[:12];evidence={'page':page_index+1,'articleBox':s['box'],'axis':axis,'articleSource':'annotazione rossa','labelSource':'OCR tabella' if image else 'da leggere','labelOcr':label_ocr,'catalogueDescription':product['description'],'pdf':url,'rawCells':{'label':label_raw,'current':current,'curve':curve,'ka':ka,'voltage':raw_voltage,'cable':cable,'formation':formation,'length':length,'idn':idn,'dtype':dtype,'delay':delay}}
+-   if description_y:evidence['labelBox']=[max(0,axis-span),max(0,description_y-5),min(w,axis+span),min(h,description_y+12)]
+-   if description_y and label=='Utenza da leggere':warnings.append('Denominazione non letta con sufficiente chiarezza: completare la linea in revisione.')
+-   if outline_table:evidence.update(axisSource='vector_schedule_cell',scheduleCell=label_ocr.get('box') if label_ocr else None,labelSource='OCR cella vettoriale')
+-   if axis in snap_evidence:evidence.update(axisSource='raster_schedule_grid',redCodeAxis=snap_evidence[axis],scheduleColumnCenters=schedule_centers)
+-   if (article,tuple(s['box'])) in axis_evidence:evidence.update(axisSource='contact_geometry',symbolGeometry=axis_evidence[(article,tuple(s['box']))])
+-   attached=[a for a,sa in accessories if abs((sa['box'][0]+sa['box'][2])/2-(s['box'][0]+s['box'][2])/2)<20 and abs(sa['box'][1]-s['box'][1])<90]
+-   # Red quotation articles are the operator's selected equipment. When the
+-   # scanned schedule is unreadable or conflicts, keep the scan as evidence but
+-   # populate switch ratings from the red article's catalogue specification.
+-   if product.get('poles') and product.get('current') is not None:
+-    rated=str(product['poles'])+'/'+f'{product["current"]:g}A'
+-    if v.get('taratura_progetto_letta') and v['taratura_progetto_letta']!=rated:
+-     v['taratura_in_conflitto']=v['taratura_progetto_letta'];v['conflict_current']=True
+-     warnings.append(f'Dubbio: tabella scansionata {v["taratura_progetto_letta"]}, articolo rosso {rated}. Applicata la specifica dell\'articolo rosso; verificare il conflitto.')
+-    v['taratura']=rated;v['poli']=product['poles'];v['corrente_A']=product['current']
+-    if product.get('curve'):v['curva_Im']=product['curve']
+-   accessory_specs=[(a,specs(a,CAT[a])) for a in attached if a in CAT]
+-   differential=next(((a,sp) for a,sp in accessory_specs if sp.get('kind')=='MOD_DIFF'),None)
+-   if kind=='MT' and attached:kind='MTD';v['accessorio_a']=attached[0]
+-   if differential and differential[1].get('diff_mA'):
+-    differential_article,differential_spec=differential;desc=CAT.get(differential_article,{}).get('descrizione','')
+-    dtype_match=re.search(r'(?:magn(?:etot)?\s*diff(?:erenziale)?\s+)(AC|A|F|B)\b',desc,re.I) or re.search(r'\b(AC|A|F|B)\s*$',desc,re.I);dtype=dtype_match[1].upper() if dtype_match else 'DA VERIF.'
+-    v['differenziale']=dtype+'/'+str(differential_spec['diff_mA'])+'mA'
+-    warnings.append('Tipo e soglia differenziale proposti dall’articolo rosso associato; verificare coerenza della coppia.')
+-   elif product.get('diff_mA'):
+-    desc=product.get('description','');dtype_match=re.search(r'(?:magn(?:etot)?\s*diff(?:erenziale)?\s+)(AC|A|F|B)\b',desc,re.I) or re.search(r'\b(AC|A|F|B)\s*$',desc,re.I);dtype=dtype_match[1].upper() if dtype_match else 'DA VERIF.'
+-    v['differenziale']=dtype+'/'+str(product['diff_mA'])+'mA'
+-   evidence['redArticleSpecification']={k:product.get(k) for k in ('description','kind','poles','current','curve','diff_mA','compatibility_family_kA')}
+-   evidence['redAccessorySpecifications']=[{'article':a,'description':sp.get('description'),'kind':sp.get('kind'),'poles':sp.get('poles'),'current':sp.get('current'),'diff_mA':sp.get('diff_mA')} for a,sp in accessory_specs]
+-   if outline_table:
+-    designations=[word for word in table_words if re.fullmatch(r'Q[A-Z]{0,3}[0-9]{0,3}',word['text']) and len(word['text'])>=2 and abs((word['box'][0]+word['box'][2])/2-axis)<30 and s['box'][1]-55<word['box'][1]<s['box'][1]]
+-    if len(designations)==1 and not any(n['sigla']==designations[0]['text'] for n in nodes+page_nodes):
+-     evidence['siglaSource']={'method':'OCR near device column','box':designations[0]['box'],'generatedFallback':sigla,'status':'proposed'}
+-     sigla=designations[0]['text']
+-     warnings[0]='Sigla rilevata vicino al simbolo nel PDF: confermare la lettura.'
+-   cable_readings=[]
+-   for cable_key,heading,raw_value,caption,crop_key in [('tipo_cavo',cable_y,cable,'Tipo di cavo','cable'),('composizione_cavo',formation_y,formation,'Formazione cavo','formation')]:
+-    if heading is None:continue
+-    box=[max(0,axis-span),max(0,heading-3.7),min(w,axis-1 if crop_key=='cable' else axis+span),min(h,heading+3.7)]
+-    proposed=v.get(cable_key,'')
+-    status='ambiguous' if field_review.get(cable_key,{}).get('status')=='ambiguous' or not proposed else 'proposed'
+-    cable_readings.append({'field':cable_key,'caption':caption,'box':box,'raw':raw_value,'value':proposed,'status':status})
+-   evidence['cableReadings']=cable_readings
+-   node={'id':ident,'sigla':sigla,'kind':kind,'label':label,'articles':[article]+attached,'values':v,'fieldReview':field_review,'parent':None,'confirmed':False,'connectionConfirmed':False,'warnings':warnings,'evidence':evidence,'x':40,'y':40,'imported':True};page_nodes.append(node)
+-   if unlisted:
+-    node['requiresTechnicalReview']=True;node['selectionError']=True
+-    evidence['functionSource']='geometria PDF, funzione da confermare'
+-    evidence['symbolGeometry']=unknown[unknown_key]['geometry']
+-    for component in unresolved_components:
+-     if component['article']==article and component['page']==page_index+1 and tuple(component['box'])==tuple(s['box']):
+-      component['linkedPowerNode']=ident
+-      component['integrationStatus']='funzione_proposta_articolo_da_verificare'
+-   publish_page(page_index,nodes+page_nodes,notes,'etichette',10+60*page_index/max(1,len(doc)),f'Pagina {page_index+1} · {sigla}: {label}')
+-   if cable_readings:
+-    publish_page(page_index,nodes+page_nodes,notes,'cavi',11+60*page_index/max(1,len(doc)),f'Pagina {page_index+1} · {sigla}: tipo e formazione cavo letti, da verificare.')
+-  page_nodes.extend(detect_contactors(page,ss,axes,unresolved_components,folder,page_index,counts,url))
+-  attach_catalogued_auxiliaries(page_nodes,unresolved_components,page_index)
+-  attach_catalogued_symbols(page_nodes,unresolved_components,page_index)
+-  typed_nodes=False
+-  if not page_nodes:
+-   typed_nodes=True
+-   if page_index not in word_cache:word_cache[page_index]=raster_spans(page,folder,page_index,False)
+-   page_nodes=breaker_columns_without_codes(page,folder,page_index,settings,counts,url,word_cache[page_index])
+-   if page_nodes:
+-    ref_words=refine_page_references(page,word_cache[page_index],folder,page_index)
+-    topology_records.append({'page':page_index+1,'trace':trace_page(page_nodes,lines,ref_words,w,h,junctions=junctions(page))})
+-  if not typed_nodes:
+-   feeder_proposals(page_nodes,lines,w,h)
+-   signals=read_signal_arrows(page,folder,page_index,TESSERACT) if page_nodes else []
+-   topology_records.append({'page':page_index+1,'trace':trace_page(page_nodes,lines,ss,w,h,signals,junctions(page))})
+-  publish_page(page_index,nodes+page_nodes,notes,'linee',12+60*page_index/max(1,len(doc)),f'Pagina {page_index+1} · reti di fili tracciate; collegamenti ancora da confermare.',{'pageTraces':topology_records})
+-  page_networks=[network for network in protective_networks if network['page']==page_index+1]
+-  page_trace=next((record['trace'] for record in topology_records if record['page']==page_index+1),{})
+-  measurement_assemblies.extend(detect_measurement(page,unresolved_components,page_nodes,page_trace))
+-  attach_measurement_fuses(page,measurement_assemblies,unresolved_components)
+-  if page_networks:trace_earth_outlets(page_networks,earth_segments(page),page_trace.get('ports',{}),junctions(page))
+-  equipment_candidates.extend(collect_evidence(ss+word_cache.get(page_index,[]),page_index+1))
+-  nodes.extend(page_nodes)
+-  publish_page(page_index,nodes,notes,'interpretata',8+60*(page_index+1)/max(1,len(doc)),f'Pagina {page_index+1}/{len(doc)} · {len(page_nodes)} apparecchi candidati, {len(unresolved_components)} componenti accessori da controllare.',{'pageTraces':topology_records})
+-  if not page_nodes:messages.append(f'Pagina {page_index+1}: nessun apparecchio identificato tramite articolo rosso. Riconoscimento dei simboli senza codici ancora da completare.')
+- for node in nodes:
+-  if node['kind'] not in ['MT','MTD']:continue
+-  try:
+-   node['ratingReview']={'status':'documented',**validate_device_rating(node,settings)}
+-  except ValueError as error:
+-   node['ratingReview']={'status':'blocked','message':str(error)}
+-   node['warnings'].append('Verifica kA: '+str(error))
+- topology=connect_pages(topology_records,nodes) if topology_records else None
+- # Raster schedules can still expose bus segments after vector geometry has
+- # been flattened. Treat each uninterrupted segment as evidence; never infer
+- # that every device on a sheet is downstream of the largest breaker.
+- raster_topology=[]
+- for page_index,page in enumerate(doc):
+-  page_nodes=[n for n in nodes if int(n.get('evidence',{}).get('page',0))==page_index+1]
+-  if not page_nodes or not all(n.get('evidence',{}).get('axisSource')=='raster_schedule_grid' for n in page_nodes):continue
+-  bus=raster_bus_evidence(page,page_nodes)
+-  if not bus:continue
+-  by_axis=sorted(page_nodes,key=lambda n:float(n.get('evidence',{}).get('axis',0)))
+-  labelled=[n for n in page_nodes if re.search(r'\b(?:GENERALE|QUADRO)\b',n.get('label',''),re.I)]
+-  root=None
+-  if len(labelled)==1:
+-   root=labelled[0]
+-   if not re.search(r'\bGENERALE\b',root.get('label',''),re.I):
+-    ratings=[]
+-    for n in page_nodes:
+-     match=re.search(r'/\s*([\d.]+)\s*A',n.get('values',{}).get('taratura',''))
+-     if match:ratings.append((float(match[1]),n))
+-    if not ratings or max(ratings,key=lambda item:item[0])[1]['id']!=root['id']:root=None
+-  proposals=[]
+-  if root:
+-   root_axis=float(root['evidence']['axis'])
+-   # A separate segment upstream of the general stays a parallel incoming
+-   # protection branch (for example an SPD); downstream segments alone become
+-   # children of the general.
+-   incoming=next((s for s in bus['segments'] if root['id'] in s['devices']),None)
+-   if incoming:
+-    upstream=[n for n in page_nodes if n['id'] in incoming['devices']]
+-    source_group=f'RASTER_INCOMING_PAGE_{page_index+1}'
+-    for n in upstream:
+-     n['parent']=None;n['connectionStatus']='da_definire';n['imported']=True
+-     n.setdefault('values',{})['externalSupplyGroup']=source_group
+-     n['values']['externalSupplyLabel']='ARRIVO LINEA · DA VERIFICARE'
+-     n['connectionReview']={'status':'proposed','source':'raster_horizontal_bus_segment','page':page_index+1,'segment':incoming,'parent':None,'reason':'Ramo sulla barra di arrivo distinta, parallelo al generale; confermare continuità e funzione.'}
+-     n.setdefault('warnings',[]).append('Barra di arrivo proposta; ramo parallelo al generale da confermare sul PDF.')
+-    for segment in bus['segments']:
+-     ids=segment['devices']
+-     if segment['x0']<=root_axis+8 or len(ids)<3:continue
+-     children_on_segment=[n for n in page_nodes if n['id'] in ids and n['id']!=root['id']]
+-     if len(children_on_segment)<3:continue
+-     for child in children_on_segment:
+-      child['parent']=root['id'];child['connectionStatus']='raster_bus_proposal';child['imported']=True
+-      child['connectionReview']={'status':'proposed','source':'raster_horizontal_bus_segment','page':page_index+1,'segment':segment,'parent':root['id'],'reason':'Il ramo interseca una dorsale raster distinta a valle del generale; confermare il collegamento.'}
+-      child.setdefault('warnings',[]).append('Collegamento alla dorsale a valle proposto dalla geometria raster; confermare sul PDF.')
+-      proposals.append(child['id'])
+-    root.setdefault('evidence',{})['generalDetection']={'status':'proposed','source':'OCR denomination + red article rating','rationale':'Etichetta del generale e segmenti raster distinti a monte e a valle.'}
+-   else:
+-    root=None
+-  if not root:
+-   # A bus continuing across a raster schedule can be represented as one
+-   # shared, unconfirmed feed without inventing a device as its parent.
+-   supported={ident for segment in bus['segments'] for ident in segment['devices']}
+-   if len(supported)>=max(4,round(len(page_nodes)*.6)):
+-    source_group=f'RASTER_CONTINUATION_PAGE_{page_index+1}'
+-    for n in page_nodes:
+-     n['parent']=None;n['connectionStatus']='da_definire';n['imported']=True
+-     n.setdefault('values',{})['externalSupplyGroup']=source_group
+-     n['values']['externalSupplyLabel']='CONTINUITÀ ALIMENTAZIONE · DA VERIFICARE'
+-     direct=n['id'] in supported
+-     n['connectionReview']={'status':'proposed','source':'raster_horizontal_bus_segments','page':page_index+1,'segments':[s for s in bus['segments'] if n['id'] in s['devices']],'parent':None,'directIntersection':direct,'reason':'Dorsale comune proposta dalla copertura geometrica; continuità tra segmenti e rimando di pagina da confermare.' if direct else 'Il ramo non interseca direttamente un segmento rilevato; è incluso solo nella proposta di dorsale comune e richiede verifica visiva.'}
+-     n.setdefault('warnings',[]).append('Alimentazione comune/continuazione proposta; verificare la dorsale, i rami e la freccia/catenaria tra pagine.')
+-     proposals.append(n['id'])
+-  if proposals:raster_topology.append({'page':page_index+1,'root':root['id'] if root else None,'children':proposals,'bus':bus})
+- associate_contactor_labels(nodes)
+- if topology:topology['pageTraces']=topology_records
+- if topology is None and raster_topology:topology={'method':'vector_topology_plus_raster_bus_proposals','rasterProposals':raster_topology,'pageTraces':topology_records}
+- elif topology and raster_topology:topology['rasterProposals']=raster_topology
+- project={'schemaVersion':1,'name':pathlib.Path(name).stem,'settings':settings,'nodes':nodes,'sourcePdf':url,'equipmentCandidates':equipment_candidates,'importReview':{'pages':len(doc),'nodes':len(nodes),'messages':messages,'method':'red article + table OCR + vector wires + layout-neutral textual candidates','completeRecognition':False,'topology':topology,'redVision':red_vision}}
+- update('rete_e_controlli',82,'Ricompongo i segmenti di alimentazione e controllo le associazioni.')
+- project['scanPreview']=make_scan_previews(doc,nodes,folder,topology)
+- for item in project['scanPreview']:
+-  item['phase']='rete_verificata'
+-  item['redAnnotations']=[{'text':note['text'],'box':note['bbox'],'catalogueMatch':note['catalogueMatch']} for note in notes if note['page']==item['page']]
+- update('anteprime',96,'Verifica finale delle evidenze sovrapposte al PDF.',previewPages=project['scanPreview'],currentPage=len(doc),totalPages=len(doc),nodesDetected=len(nodes))
+- if protective_networks:project['protectiveNetworks']=protective_networks
+- if measurement_assemblies:project['measurementAssemblies']=measurement_assemblies
+- if requirements:
+-  requirements['previousSettings']=initial_settings;project['boardRequirements']=requirements
+-  messages.insert(0,f'Requisiti kA rilevati a pagina {requirements["page"]}: confermare prima del DWG.')
+- if unresolved_components:
+-  project['unresolvedComponents']=unresolved_components
+-  messages.insert(0,f'{sum(c["requiresIntegration"] for c in unresolved_components)} componenti aggiuntivi individuati, da classificare o integrare prima del definitivo.')
+- update('completato',100,f'Analisi terminata: {len(nodes)} apparecchi proposti; le decisioni restano da verificare.')
+- return {'pages':len(doc),'redNotes':notes,'preview':url,'project':project,'message':f'{len(nodes)} apparecchi proposti. Verificare etichette, sigle, dati e alimentazioni. '+(' '.join(messages))}
+-
++"""Local PDF interpretation: annotations, table OCR and vector-wire evidence.
++Every proposal remains unconfirmed. Missing evidence never implies an external feed.
++"""
++import os,re,json,pathlib,subprocess,collections,uuid,csv,io
++from engine import ROOT,STUDIO,CAT,specs,classify,rating,select_device,validate_device_rating
++import pymupdf
++from PIL import Image
++from board_requirements import extract as extract_requirements,apply as apply_requirements
++from pdf_topology import trace_page,connect_pages
++from pdf_signal_references import read_signal_arrows
++from pdf_unknown_power import unknown_switches,locate_switch,segments as switch_segments
++from pdf_contactors import detect as detect_contactors,associate_labels as associate_contactor_labels
++from pdf_junctions import junctions
++from pdf_wire_geometry import orientation as wire_orientation
++from switch_drawing import conductor_spec
++from pdf_protective_earth import from_page as protective_earth_from_page,page_segments as earth_segments,trace_outlets as trace_earth_outlets
++from component_inventory import collect as collect_components,STANDARD as STANDARD_COMPONENTS
++from document_evidence import collect as collect_evidence
++from pdf_measurement import detect as detect_measurement
++from pdf_measurement_fuses import attach as attach_measurement_fuses
++from pdf_annotazioni import estrai_articoli as annotation_articles
++import rossi_vision
++
++import config
++TESSERACT=config.percorso('tesseract')
++
++def attach_catalogued_auxiliaries(page_nodes,components,page_index):
++ """Attach red auxiliary-contact codes to the nearest breaker column.
++
++ The code stays in its own first-free accessory attribute slot; a differential
++ module already occupying accessorio_a is never overwritten.
++ """
++ breakers=[n for n in page_nodes if n.get('kind') in ('MT','MTD','QS')]
++ if not breakers:return []
++ axes=sorted({float(n.get('evidence',{}).get('axis',0)) for n in breakers})
++ spacing=min((b-a for a,b in zip(axes,axes[1:])),default=56.0)
++ attached=[]
++ for component in components:
++  if component.get('page')!=page_index+1 or component.get('electricalFunction')!='CONTATTO_AUSILIARIO_DI_STATO':continue
++  box=component.get('box') or []; 
++  if len(box)!=4:continue
++  x=(box[0]+box[2])/2
++  ranked=sorted(((abs(float(n['evidence']['axis'])-x),n) for n in breakers),key=lambda item:item[0])
++  if not ranked or ranked[0][0]>max(18.0,spacing*.55):continue
++  if len(ranked)>1 and abs(ranked[1][0]-ranked[0][0])<2.0:continue
++  node=ranked[0][1];article=component['article'];values=node.setdefault('values',{})
++  if article in node.get('articles',[]):
++   component['linkedPowerNode']=node['id'];continue
++  slot=next((key for key in ('accessorio_a','accessorio_b','accessorio_c') if not values.get(key)),None)
++  if slot is None:
++   component['integrationStatus']='accessorio_rilevato_slot_esauriti';component['linkedPowerNode']=node['id'];continue
++  values[slot]=article;node.setdefault('articles',[]).append(article)
++  accessory={'article':article,'slot':slot,'function':component['electricalFunction'],'source':'red_code_and_local_listino','symbol':'BT_F80RC05'}
++  node.setdefault('accessories',[]).append(accessory)
++  node.setdefault('evidence',{}).setdefault('catalogueAccessoryEvidence',[]).append({'article':article,'box':box,'slot':slot,'manufacturerDescription':component.get('manufacturerDescription','')})
++  node.setdefault('warnings',[]).append(f'{article}: contatto ausiliario di stato proposto nello slot {slot}; verificare il contatto e la posizione sul PDF.')
++  component['linkedPowerNode']=node['id'];component['integrationStatus']='contatto_ausiliario_associazione_proposta';component['requiresIntegration']=False
++  attached.append({'article':article,'node':node['sigla'],'slot':slot})
++ return attached
++
++def attach_catalogued_symbols(page_nodes,components,page_index):
++ """Keep red-coded non-breaker apparatus in the drawing review model."""
++ attachable={'SPD'}
++ devices=[n for n in page_nodes if n.get('kind') in ('MT','MTD','RCD','QS')]
++ attached=[]
++ for component in components:
++  if component.get('page')!=page_index+1 or component.get('electricalFunction') not in attachable:continue
++  box=component.get('box') or []
++  if len(box)!=4 or not devices:continue
++  x=(box[0]+box[2])/2
++  ranked=[]
++  for node in devices:
++   # The red callout's text origin is often offset from the switch axis.
++   # Prefer the center of its red article box when associating nearby symbols.
++   ref=node.get('evidence',{}).get('redCodeAxis',node.get('evidence',{}).get('axis',0))
++   ranked.append((abs(float(ref)-x),node))
++  ranked.sort(key=lambda item:item[0])
++  if not ranked:continue
++  node=ranked[0][1];modules=node.setdefault('catalogueModules',[])
++  if any(m.get('article')==component['article'] and m.get('box')==box for m in modules):continue
++  module={'article':component['article'],'function':component['electricalFunction'],'source':'red_code_and_local_catalogue','box':box,'associationStatus':'proposed','manufacturerDescription':component.get('manufacturerDescription','')}
++  modules.append(module)
++  if component['article'] not in node.setdefault('articles',[]):node['articles'].append(component['article'])
++  values=node.setdefault('values',{})
++  slot=next((key for key in ('accessorio_a','accessorio_b','accessorio_c') if not values.get(key)),None)
++  if slot:values[slot]=component['article'];module['slot']=slot
++  node.setdefault('evidence',{}).setdefault('catalogueModuleEvidence',[]).append(module.copy())
++  node.setdefault('warnings',[]).append(f"{component['article']}: simbolo nativo inserito come apparecchio rilevato; associazione elettrica da verificare sul progetto.")
++  component['linkedPowerNode']=node['id'];component['integrationStatus']='simbolo_nativo_associazione_proposta';component['requiresIntegration']=True
++  attached.append({'article':component['article'],'node':node['sigla'],'function':component['electricalFunction']})
++ return attached
++
++def raster_spans(page,folder,index,red_only=False):
++ """Read outlines/raster annotations locally; preserve the original word boxes."""
++ if not TESSERACT.is_file():return []
++ pix=page.get_pixmap(matrix=pymupdf.Matrix(3,3),alpha=False);image=Image.frombytes('RGB',[pix.width,pix.height],pix.samples)
++ if red_only:
++  import numpy as np
++  rgb=np.asarray(image);mask=(rgb[:,:,0]>150)&(rgb[:,:,1]<125)&(rgb[:,:,2]<125)&(rgb[:,:,0].astype(int)-rgb[:,:,1].astype(int)>60)
++  if mask.sum()<20:return []
++  image=Image.fromarray(np.where(mask,0,255).astype('uint8'))
++ file=folder/f'ocr_page_{index}_{"red" if red_only else "black"}.png';image.save(file)
++ result=subprocess.run([str(TESSERACT),str(file),'stdout','--psm','11','tsv'],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0),timeout=45)
++ words=[]
++ for r in csv.DictReader(io.StringIO(result.stdout.decode('utf-8',errors='replace')),delimiter='\t'):
++  if not r.get('text','').strip():continue
++  x,y,w,h=[int(r[k])/3 for k in ['left','top','width','height']]
++  words.append({'text':r['text'].strip(),'box':[x,y,x+w,y+h],'color':0xff0000 if red_only else 0,'ocrConfidence':float(r['conf'])})
++ return words
++
++def spans(page):
++ return [{'text':s['text'].strip(),'box':list(pymupdf.Rect(s['bbox'])*page.rotation_matrix),'color':s['color']} for b in page.get_text('dict')['blocks'] for l in b.get('lines',[]) for s in l['spans'] if s['text'].strip()]
++
++def vector_lines(page):
++ lines=[]
++ for drawing in page.get_drawings():
++  if drawing.get('dashes','[] 0') not in ['[] 0','[] 0.0','']:continue
++  for item in drawing['items']:
++   if item[0]!='l':continue
++   a,b=item[1]*page.rotation_matrix,item[2]*page.rotation_matrix
++   if wire_orientation(a,b):lines.append(((a.x,a.y),(b.x,b.y)))
++ return lines
++
++def schedule_column_centers(page):
++ """Estimate raster schedule columns from long vertical table rules."""
++ if not TESSERACT.is_file():return []
++ import numpy as np
++ pix=page.get_pixmap(matrix=pymupdf.Matrix(3,3),alpha=False)
++ rgb=np.frombuffer(pix.samples,dtype=np.uint8).reshape(pix.height,pix.width,pix.n)
++ gray=rgb[:,:,:3].mean(axis=2)
++ h,w=page.rect.height,page.rect.width
++ y0,y1=int(h*.50*3),min(pix.height,int(h*.95*3))
++ x0,x1=int(w*.18*3),int(w*.94*3)
++ density=(gray[y0:y1,x0:x1]<110).mean(axis=0)
++ peaks=np.where(density>.32)[0]+x0
++ runs=[]
++ for x in peaks:
++  if not runs or x-runs[-1][-1]>5:runs.append([int(x)])
++  else:runs[-1].append(int(x))
++ boundaries=[sum(run)/len(run)/3 for run in runs if len(run)>=2 and max(density[run[0]-x0:run[-1]-x0+1])>.60]
++ centers=[]
++ for left,right in zip(boundaries,boundaries[1:]):
++  if 38<right-left<68:centers.append((left+right)/2)
++ # Random symbol strokes can look like a few vertical rules. Only publish a
++ # schedule hypothesis when a long, regularly spaced run of columns exists;
++ # otherwise leave the red-code position untouched for the normal recognizers.
++ if len(centers)<7:return []
++ gaps=np.diff(centers);median=float(np.median(gaps))
++ if median<=0 or np.max(np.abs(gaps-median))/median>.14:return []
++ return centers
++
++def outlined_schedule(page,words,lines):
++ """Recover a ruled denomination row from OCR plus vector cell borders.
++ No fixed paper size, rotation, row offset, or product-code dependent labels.
++ """
++ header=next((w for w in words if re.fullmatch(r'DENOMINAZIONE|DESCRIZIONE',w['text'],re.I) and w['box'][0]<page.rect.width*.3 and w['box'][1]>page.rect.height*.25),None)
++ if not header:return None
++ cy=(header['box'][1]+header['box'][3])/2
++ horizontal=sorted(set(round(a[1],2) for a,b in lines if abs(a[1]-b[1])<.3 and abs(a[0]-b[0])>page.rect.width*.45))
++ above=[y for y in horizontal if y<header['box'][1]];below=[y for y in horizontal if y>header['box'][3]]
++ if not above or not below:return None
++ top=max(above);bottom=min(below)
++ if not 8<bottom-top<60:return None
++ edges=sorted(set(round(a[0],2) for a,b in lines if abs(a[0]-b[0])<.3 and min(a[1],b[1])<=top+.8 and max(a[1],b[1])>=bottom-.8 and a[0]>header['box'][2]+3))
++ cells=[(a,b) for a,b in zip(edges,edges[1:]) if 25<b-a<page.rect.width*.2]
++ if len(cells)<3:return None
++ return {'top':top,'bottom':bottom,'cells':cells,'header':header['text']}
++
++
++def refine_outlined_tokens(page,words,table,folder,index):
++ """Resolve small mixed alphanumeric label tokens with independent tight OCR.
++ Preserve baseline and both readings; accept only a nonempty exact agreement.
++ """
++ image=None;result=[]
++ for ordinal,word in enumerate(words):
++  token=word['text'];x0,y0,x1,y1=word['box']
++  eligible=table['top']<y0<table['bottom'] and x0>page.rect.width*.2 and bool(re.search(r'[A-Za-z]',token)) and bool(re.search(r'[0-9.]',token)) and len(token)<=24
++  if not eligible:result.append(word);continue
++  if image is None:
++   pix=page.get_pixmap(matrix=pymupdf.Matrix(8,8),alpha=False);image=Image.frombytes('RGB',[pix.width,pix.height],pix.samples)
++  target=folder/f'{index}_label_token_{ordinal}.png'
++  image.crop(tuple(round(v*8) for v in (x0-1,y0-1,x1+1,y1+1))).convert('L').save(target)
++  readings=[]
++  for mode in (7,13):
++   run=subprocess.run([str(TESSERACT),str(target),'stdout','--psm',str(mode),'-c','tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.'],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0),timeout=15)
++   readings.append(run.stdout.decode('utf-8',errors='replace').strip())
++  agreed=bool(readings[0]) and readings[0]==readings[1]
++  result.append({**word,'text':readings[0] if agreed else token,'originalText':token,'refinement':{'method':'8x tight word OCR; psm7 and psm13','readings':readings,'accepted':agreed}})
++ return result
++
++
++def outlined_label(words,table,axis):
++ bounds=next(((a,b) for a,b in table['cells'] if a<axis<b),None)
++ if bounds is None:return '',None
++ a,b=bounds;selected=[w for w in words if a+1<(w['box'][0]+w['box'][2])/2<b-1 and table['top']+.5<(w['box'][1]+w['box'][3])/2<table['bottom']-.5]
++ selected.sort(key=lambda w:(round(w['box'][1]/4),w['box'][0]))
++ text=' '.join(w['text'].replace('_',' ') for w in selected).strip()
++ return text,{'source':'OCR bounded by vector table cell','box':[a,table['top'],b,table['bottom']],'words':selected,'text':text}
++
++
++def read_cell(image,box,folder,key):
++ if not TESSERACT.is_file():return ''
++ x0,y0,x1,y1=box;crop=image.crop(tuple(round(v*4) for v in box)).convert('L')
++ if crop.width<8 or crop.height<8:return ''
++ import numpy as np
++ pixels=np.asarray(crop).copy();borders=(pixels<220).mean(axis=1)>.75;pixels[borders]=255;vertical=(pixels<220).mean(axis=0)>.85;pixels[:,vertical]=255;crop=Image.fromarray(np.pad(pixels,8,constant_values=255))
++ file=folder/(key+'.png');crop.save(file)
++ command=[str(TESSERACT),str(file),'stdout','--psm','6' if key.endswith('label') else '7']
++ if key.endswith('current'):command+=['-c','tessedit_char_whitelist=0123456789PpNnxX+/']
++ elif key.endswith('curve'):command+=['-c','tessedit_char_whitelist=0123456789BCD/']
++ elif key.endswith('ka'):command+=['-c','tessedit_char_whitelist=0123456789.,-']
++ result=subprocess.run(command,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0),timeout=15)
++ return result.stdout.decode('utf-8',errors='replace').strip()
++
++def read_schedule_label(image,axis,half_width,heading_y,folder,key):
++ """OCR a full schedule denomination row, not a thin one-line crop.
++
++ Raster schedules often wrap the circuit name over two lines. Keeping the
++ heading-based row bounds and comparing sparse/block OCR avoids reading only
++ the voltage printed in the row immediately below.
++ """
++ if image is None or not TESSERACT.is_file() or not heading_y:return {'text':'','readings':[]}
++ scale=4;x0=max(0,axis-half_width+1);x1=min(image.width/scale,axis+half_width-1)
++ # Denominations may occupy two printed lines below the heading. The former
++ # 14 pt crop consistently retained only "QUADRO" and lost "GENERALE".
++ y0=max(0,heading_y-16);y1=min(image.height/scale,heading_y+30)
++ crop=image.crop(tuple(round(v*scale) for v in (x0,y0,x1,y1))).convert('L')
++ if crop.width<18 or crop.height<20:return {'text':'','readings':[]}
++ import numpy as np
++ from PIL import ImageEnhance,ImageFilter
++ pix=np.asarray(crop).copy()
++ # Remove only the border rules touching the crop edges; retain letter strokes.
++ for edge in (0,1,-2,-1):
++  if edge>=0:pix[edge,:]=255
++  else:pix[edge,:]=255
++ crop=Image.fromarray(pix).resize((crop.width*3,crop.height*3),Image.Resampling.LANCZOS)
++ crop=ImageEnhance.Contrast(crop).enhance(1.6).filter(ImageFilter.MedianFilter(3))
++ file=folder/(key+'_full.png');crop.save(file)
++ readings=[]
++ for mode in (6,11,7):
++  r=subprocess.run([str(TESSERACT),str(file),'stdout','--psm',str(mode)],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0),timeout=15)
++  raw=' '.join(r.stdout.decode('utf-8',errors='replace').split())
++  # A schedule name is in its own ruled row; discard voltage leakage from the
++  # following row without using switch ratings or labels as guessed values.
++  cleaned=re.sub(r'\b(?:230|240|380|400|415)\b',' ',raw,flags=re.I)
++  cleaned=' '.join(cleaned.split()).strip(' |_-:;')
++  letters=len(re.findall(r'[A-Za-zÀ-ÿ]',cleaned));digits=len(re.findall(r'\d',cleaned))
++  score=letters-2*digits+min(len(cleaned),40)*.02
++  readings.append({'mode':mode,'raw':raw,'text':cleaned,'score':score})
++ token_rows=[]
++ for reading in readings:
++  tokens=[re.sub(r'[^A-ZÀ-ÖØ-Þ0-9]','',word.upper()) for word in reading['text'].split()]
++  token_rows.append([token for token in tokens if token])
++ votes=collections.Counter(token for row in token_rows[:2] for token in set(row))
++ consensus=[]
++ for token in token_rows[0]:
++  if votes[token]>=2 and token not in consensus:consensus.append(token)
++ consensus_text=' '.join(consensus)
++ score=sum(len(token) for token in consensus if len(token)>1)
++ # Do not promote a long but unstable OCR hallucination to a circuit label.
++ return {'text':consensus_text if score>=4 else '', 'readings':readings,'score':score}
++
++def raster_bus_evidence(page,nodes):
++ """Trace continuous raster rails and report which device axes they cross."""
++ if len(nodes)<3:return None
++ pix=page.get_pixmap(matrix=pymupdf.Matrix(3,3),alpha=False)
++ rgb=Image.frombytes('RGB',[pix.width,pix.height],pix.samples).convert('L')
++ import numpy as np
++ ink=np.asarray(rgb)<110;h,w=ink.shape;page_h=page.rect.height;page_w=page.rect.width
++ valid=[n for n in nodes if 2<float(n.get('evidence',{}).get('axis',-1))<page_w-2]
++ if len(valid)<3:return None
++ candidates=[]
++ for ypt in np.arange(page_h*.095,page_h*.16,.75):
++  y=round(ypt*3)
++  xlo=round(page_w*.10*3);xhi=round(page_w*.94*3)
++  # The raster may be skewed a few pixels across the sheet. Use a narrow
++  # vertical tolerance band so the bus survives mild scan rotation without
++  # bridging genuinely separate same-height rails.
++  row=ink[max(0,y-4):min(h,y+5),xlo:xhi]
++  projection=row.mean(axis=0)>.18
++  runs=[];start=None
++  for index,value in enumerate(np.r_[projection,False]):
++   if value and start is None:start=index
++   elif not value and start is not None:
++    if index-start>=24:runs.append([start,index])
++    start=None
++  # Raster noise and symbols create small breaks in a real bus. Bridge at
++  # most 8 pt; larger gaps remain distinct electrical nets.
++  merged=[]
++  for a,b in runs:
++   if merged and a-merged[-1][1]<=24:merged[-1][1]=b
++   else:merged.append([a,b])
++  segments=[]
++  for a,b in merged:
++   lo=(xlo+a)/3;hi=(xlo+b)/3;crossed=[]
++   for n in valid:
++    axis=float(n['evidence']['axis'])
++    px=round(axis*3)
++    sample=ink[max(0,y-4):min(h,y+5),max(0,px-2):min(w,px+3)]
++    if lo-12<=axis<=hi+12 and sample.sum()>=4:crossed.append(n['id'])
++   if hi-lo>=8:segments.append({'x0':round(lo,2),'x1':round(hi,2),'devices':crossed,'length':round(hi-lo,2)})
++  support=len({ident for s in segments for ident in s['devices']})
++  if support>=2:candidates.append({'y':round(ypt,2),'segments':segments,'support':support})
++ if not candidates:return None
++ best=max(candidates,key=lambda q:(q['support'],sum(s['length'] for s in q['segments'] if s['devices'])))
++ return {'y':best['y'],'axisSupport':round(best['support']/len(valid),3),'segments':best['segments'],'source':'raster_horizontal_bus_segments','status':'proposed'}
++
++def make_scan_previews(doc,nodes,folder,topology,page_indices=None):
++ """Create lightweight page rasters plus vector coordinates for the scan inspector."""
++ pages=[];proposals=(topology or {}).get('rasterProposals',[])
++ try:base='/'+folder.resolve().relative_to(ROOT.resolve()).as_posix()
++ except ValueError:return pages
++ for index in (range(len(doc)) if page_indices is None else page_indices):
++  page=doc[index]
++  image_name=f'scan_page_{index+1}.png'
++  if not (folder/image_name).is_file():
++   pix=page.get_pixmap(matrix=pymupdf.Matrix(1.35,1.35),alpha=False);pix.save(folder/image_name)
++  page_nodes=[n for n in nodes if int(n.get('evidence',{}).get('page',0))==index+1]
++  proposal=next((x for x in proposals if x.get('page')==index+1),None);bus=proposal.get('bus') if proposal else None
++  pages.append({'page':index+1,'image':base+'/'+image_name,'width':round(page.rect.width,2),'height':round(page.rect.height,2),
++   'nodes':[{'id':n['id'],'sigla':n['sigla'],'label':n.get('label',''),'article':n.get('values',{}).get('articolo',''),
++    'axis':n.get('evidence',{}).get('axis'),'articleBox':n.get('evidence',{}).get('articleBox'),
++    'labelBox':n.get('evidence',{}).get('labelBox') or n.get('evidence',{}).get('scheduleCell'),
++    'labelStatus':n.get('fieldReview',{}).get('utenza',{}).get('status','proposed'),
++    'cableReadings':n.get('evidence',{}).get('cableReadings',[]),
++    'connection':n.get('connectionReview',{}),'parent':n.get('parent')} for n in page_nodes],
++   'wireNetworks':next((r.get('trace',{}).get('wireNetworks',[]) for r in (topology or {}).get('pageTraces',[]) if r.get('page')==index+1),[]),
++   'bus':bus,'topologyProposal':proposal,'sourceGroup':next((n.get('values',{}).get('externalSupplyGroup') for n in page_nodes if n.get('values',{}).get('externalSupplyGroup')),None),
++   'issues':[{'node':n['sigla'],'message':w} for n in page_nodes for w in n.get('warnings',[]) if any(k in w.lower() for k in ('alimentaz','collegamento','utenza','verificare'))]})
++ return pages
++
++def refine_page_references(page,words,folder,index):
++ result=[];image=None
++ for ordinal,word in enumerate(words):
++  if re.fullmatch(r'PAG\.?\s*[A-Z]\.?',word['text'],re.I):
++   if image is None:
++    pix=page.get_pixmap(matrix=pymupdf.Matrix(8,8),alpha=False);image=Image.frombytes('RGB',[pix.width,pix.height],pix.samples)
++   x0,y0,x1,y1=word['box']
++   file=folder/f'{index}_{ordinal}_PAG_ref.png';image.crop(tuple(round(v*8) for v in [x0-2,y0-2,x1+2,y1+2])).save(file)
++   readings=[]
++   for mode,whitelist in [(7,'0123456789.PAG'),(13,None)]:
++    command=[str(TESSERACT),str(file),'stdout','--psm',str(mode)]
++    if whitelist:command+=['-c','tessedit_char_whitelist='+whitelist]
++    read=subprocess.run(command,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0),timeout=15)
++    match=re.fullmatch(r'PAG\.?\s*(\d{1,3})\.?',read.stdout.decode('utf-8',errors='replace').strip(),re.I)
++    readings.append(match[1] if match else None)
++   if readings[0] and readings[0]==readings[1]:word={**word,'originalText':word['text'],'text':'PAG.'+readings[0],'refinement':'8x crop; psm7 and psm13 agree'}
++  result.append(word)
++ return result
++
++def formation_proposals(folder,key,baseline=None):
++ """Tight OCR of a cable cell; preserve disagreements instead of accepting 9G."""
++ file=folder/(key+'.png')
++ if not file.is_file() or not TESSERACT.is_file():return None,[],{}
++ image=Image.open(file).convert('L');box=image.point(lambda p:255-p).getbbox()
++ if not box:return None,[],{}
++ crop=image.crop(box);padded=Image.new('L',(crop.width+32,crop.height+32),255);padded.paste(crop,(16,16));padded=padded.resize((padded.width*3,padded.height*3));target=folder/(key+'_tight.png');padded.save(target)
++ readings={'confidence':{}};candidates=set()
++ if baseline:
++  original=str(baseline).strip().replace(',','.').replace(' ','').upper()
++  readings['cell']=original
++  if re.fullmatch(r'\d{1,2}G\d+(?:\.\d+)?',original):candidates.add(original)
++ for mode in [6,7,13]:
++  run=subprocess.run([str(TESSERACT),str(target),'stdout','--psm',str(mode),'tsv'],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0),timeout=15)
++  tokens=[r for r in csv.DictReader(io.StringIO(run.stdout.decode('utf-8',errors='replace')),delimiter='\t') if r.get('text','').strip()]
++  text=''.join(r['text'] for r in tokens).strip().replace(',','.').replace(' ','').upper();readings['psm'+str(mode)]=text
++  readings['confidence']['psm'+str(mode)]=min((float(r['conf']) for r in tokens),default=0)
++  if re.fullmatch(r'\d{1,2}G\d+(?:\.\d+)?',text,re.I):candidates.add(text.upper())
++  # A numeric-shaped G is only an alternate hypothesis, never a silent repair.
++  alternate=re.fullmatch(r'([1-9])[6C](\d+\.\d+)',text,re.I)
++  if alternate:candidates.add(alternate[1]+'G'+alternate[2])
++ ordered=sorted(candidates)
++ agreed=len(ordered)==1 and sum(readings.get('psm'+str(mode))==ordered[0] and readings['confidence']['psm'+str(mode)]>=70 for mode in [6,7,13])>=2
++ readings['accepted']=agreed
++ return (ordered[0] if agreed else None),ordered,readings
++
++def feeder_proposals(nodes,lines,width,height):
++ # Trace only long, continuous orthogonal conductors above the table.
++ wires=[(a,b) for a,b in lines if max(a[1],b[1])<height*.60 and min(a[0],b[0])>width*.16 and abs(a[0]-b[0])+abs(a[1]-b[1])>=10]
++ graph=collections.defaultdict(set)
++ def key(p):return (round(p[0]*2)/2,round(p[1]*2)/2)
++ def on(p,a,b):return min(a[0],b[0])-.6<=p[0]<=max(a[0],b[0])+.6 and min(a[1],b[1])-.6<=p[1]<=max(a[1],b[1])+.6
++ for a,b in wires:
++  points=[a,b]
++  for c,d in wires:
++   if abs(a[1]-b[1])<.3 and abs(c[0]-d[0])<.3:p=(c[0],a[1])
++   elif abs(a[0]-b[0])<.3 and abs(c[1]-d[1])<.3:p=(a[0],c[1])
++   else:
++    points.extend(p for p in (c,d) if on(p,a,b));continue
++   if on(p,a,b) and on(p,c,d):points.append(p)
++  points=sorted(set(key(p) for p in points),key=lambda p:p[0] if abs(a[1]-b[1])<.3 else p[1])
++  for p,q in zip(points,points[1:]):graph[p].add(q);graph[q].add(p)
++ components={};index=0
++ for point in graph:
++  if point in components:continue
++  index+=1;stack=[point]
++  while stack:
++   p=stack.pop()
++   if p in components:continue
++   components[p]=index;stack.extend(graph[p])
++ def component(p):
++  q=min(components,key=lambda q:abs(q[0]-p[0])+abs(q[1]-p[1]),default=None)
++  return components[q] if q and abs(q[0]-p[0])+abs(q[1]-p[1])<1.5 else None
++ for n in nodes:
++  x=n['evidence']['axis'];cy=n['evidence']['articleBox'][1]
++  vertical=[(a,b) for a,b in wires if abs(a[0]-x)<1.2 and abs(b[0]-x)<1.2]
++  above=[(a,b) for a,b in vertical if max(a[1],b[1])<=cy+3]
++  below=[(a,b) for a,b in vertical if min(a[1],b[1])>cy+3]
++  n['_in']=component(min(above,key=lambda ab:cy-max(ab[0][1],ab[1][1]))[0]) if above else None
++  n['_out']=component(min(below,key=lambda ab:min(ab[0][1],ab[1][1]))[0]) if below else None
++ for n in nodes:
++  parents=[p for p in nodes if p['id']!=n['id'] and p.get('_out') and p['_out']==n.get('_in')]
++  if len(parents)==1:
++   n['parent']=parents[0]['id'];n['connectionStatus']='proposta_da_linee_vettoriali';n['warnings'].append('Alimentazione proposta da continuità delle linee PDF: confermare.')
++  else:
++   n['connectionStatus']='da_definire';n['warnings'].append('Alimentazione non determinata: scegliere il padre o confermare ingresso esterno.')
++ for n in nodes:n.pop('_in',None);n.pop('_out',None)
++
++def breaker_columns_without_codes(page,folder,index,settings,counts,url,words=None):
++ """Find typed breaker columns in a summary table, not arbitrary OCR numbers."""
++ words=words if words is not None else raster_spans(page,folder,index,False);anchors=[w for w in words if w['text'].upper() in ['SCATOLATO','MODULARE'] and page.rect.height*.35<w['box'][1]<page.rect.height*.8];nodes=[]
++ image=None
++ if anchors:
++  pix=page.get_pixmap(matrix=pymupdf.Matrix(4,4),alpha=False);image=Image.frombytes('RGB',[pix.width,pix.height],pix.samples)
++ for anchor in anchors:
++  x=(anchor['box'][0]+anchor['box'][2])/2;y=(anchor['box'][1]+anchor['box'][3])/2
++  near=[w for w in words if abs((w['box'][0]+w['box'][2])/2-x)<45 and y+5<(w['box'][1]+w['box'][3])/2<y+16]
++  nominal_words=sorted(near,key=lambda w:w['box'][0]);numeric=[w for w in nominal_words if re.fullmatch(r'\d+(?:\+N)?',w['text'],re.I)]
++  if len(numeric)<2:continue
++  raw_poles=numeric[0]['text'].upper();current=int(numeric[1]['text'])
++  if raw_poles not in ['1','2','3','4','1+N','3+N'] or not 1<=current<=4000:continue
++  poles={'1+N':'1P+N','3+N':'4P'}.get(raw_poles,raw_poles+'P')
++  columns=sorted((a['box'][0]+a['box'][2])/2 for a in anchors);half=min([abs(b-a)/2 for a,b in zip(columns,columns[1:])],default=55)
++  # A breaker column may be separated from the next by instrument columns.
++  # Recover its own half-width from the N.POLI cell center, not that large gap.
++  pole_center=(numeric[0]['box'][0]+numeric[0]['box'][2])/2
++  cell_half=2*abs(x-pole_center)
++  if not 20<=cell_half<=60:cell_half=min(half,45)
++  denom=next((w for w in words if w['text'].upper()=='DENOMINAZIONE'),None);label='Utenza da leggere'
++  if denom:
++   ly=denom['box'][1];namewords=[w for w in words if abs((w['box'][0]+w['box'][2])/2-x)<half and ly-8<w['box'][1]<ly+16]
++   label=' '.join(w['text'] for w in sorted(namewords,key=lambda w:(round(w['box'][1]/4),w['box'][0]))) or label
++  counts['POWER']+=1;sigla='QF'+str(counts['POWER'])
++  def field(a,b,offset,key):
++   return read_cell(image,(a,y+offset-3.7,b,y+offset+3.7),folder,f'{index}_{sigla}_{key}')
++  # This table has Ith / Idn / class on one row and Im / Pdi on the next.
++  idn_raw=field(x,x+cell_half/2,19.7,'idn');dtype_raw=field(x+cell_half/2,x+cell_half,19.7,'dtype')
++  curve_raw=field(x-cell_half,x,29.4,'curve_full');ka_raw=field(x,x+cell_half,29.4,'ka')
++  dtype=dtype_raw.strip(' \t\n\"\'“”‘’').upper()
++  if dtype not in ['AC','A','F','B']:dtype=''
++  adjustable=bool(re.fullmatch(r'REG\.?',idn_raw.strip(),re.I))
++  diff_value=re.fullmatch(r'0[.,](\d+)',idn_raw.strip())
++  diff_mA=round(float(idn_raw.replace(',','.'))*1000) if diff_value else None
++  kind='MTD' if adjustable or diff_mA else 'MT'
++  nominal_raw=' '.join(w['text'] for w in nominal_words)
++  setting_match=re.search(r'\bR\s*(\d+)\b',nominal_raw,re.I)
++  setting=int(setting_match[1]) if setting_match else None
++  curve=curve_raw.strip().upper()
++  duplicate_curve=re.fullmatch(r'([BCD])\1',curve)
++  if duplicate_curve:curve=duplicate_curve[1]
++  magnetic_ocr=re.fullmatch(r'INX[I1]0',curve)
++  if magnetic_ocr:curve='Inx10'
++  request={'kind':kind,'poles':poles,'current':current,'curve':curve if curve in ['B','C','D'] else None,'label':label}
++  if kind=='MTD':request.update(diff_mA=diff_mA or 30,diff_type=dtype or 'UNKNOWN',diff_adjustable=adjustable)
++  if setting is not None:request['setting_current']=setting
++  warnings=['Apparecchio individuato dalla colonna del progetto; simbolo da verificare.','Articolo proposto senza codice rosso, non confermato.','Alimentazioni e rimandi tra pagine da ricostruire.']
++  values={'taratura':poles+'/'+str(current)+'A'+(f' [{setting}A]' if setting is not None else ''),'utenza':label}
++  if adjustable or diff_mA:values['differenziale']=(dtype+'/' if dtype else '')+('REG' if adjustable else f'{diff_mA/1000:g}A')
++  if curve:values['curva_Im']=curve
++  if re.fullmatch(r'\d+(?:[.,]\d+)?',ka_raw.strip()):values['project_pdi_kA']=ka_raw.strip()
++  protection={'function':kind,'construction':anchor['text'],'nominalA':current,'settingA':setting,'diffAdjustable':adjustable,'diff_mA':diff_mA,'diffType':dtype or None}
++  articles=[]
++  selection={};selection_error=False
++  try:
++   proposed=select_device(request,settings)['chosen'];original=dict(values);values.update(proposed['values']);values.update(original);articles=proposed['articles'];warnings+=proposed['warnings']
++   selection_error=proposed.get('requiresTechnicalReview',False)
++   selection={key:proposed[key] for key in ['required_kA','rated_kA','basis','voltage','description','source','requiresTechnicalReview']}
++  except ValueError as e:
++   warnings.append(str(e));selection_error=True
++   if kind=='MTD':
++    try:
++     base=select_device({**request,'kind':'MT'},settings)['chosen'];original=dict(values);values.update(base['values']);values.update(original);articles=base['articles'];selection={key:base[key] for key in ['required_kA','rated_kA','basis','voltage','description','source']}
++     warnings.append('Solo base magnetotermica proposta: il gruppo differenziale è incompleto e il definitivo resta bloccato.')
++    except ValueError:pass
++  if duplicate_curve:warnings.append('Lettera curva duplicata nell\'OCR: normalizzata a '+curve+', originale conservato nelle evidenze.')
++  if magnetic_ocr and curve_raw.strip().upper()!='INX10':warnings.append('Moltiplicatore magnetico proposto come Inx10 da OCR; controllare il campo originale, conservato nelle evidenze.')
++  nodes.append({'id':uuid.uuid4().hex[:12],'sigla':sigla,'kind':kind,'label':label,'articles':articles,'values':values,'protection':protection,'request':request,'selectionError':selection_error,**selection,'parent':None,'confirmed':False,'connectionConfirmed':False,'warnings':warnings,'connectionStatus':'da_definire','x':40,'y':40,'imported':True,'evidence':{'page':index+1,'articleBox':anchor['box'],'axis':x,'articleSource':'proposta catalogo da tabella OCR','labelSource':'OCR tabella','catalogueDescription':'Scatolato/modulare da progetto: '+anchor['text'],'pdf':url,'rawCells':{'nominal':nominal_raw,'idn':idn_raw,'dtype':dtype_raw,'curve':curve_raw,'ka':ka_raw}}})
++ return nodes
++
++def interpret(raw,name,settings,folder,url,progress=None):
++ def update(phase,percent,message,**details):
++  if progress:progress({'phase':phase,'percent':int(percent),'message':message,**details})
++ live_pages={}
++ def publish_page(index,nodes,notes,phase,percent,message,topology=None):
++  if not progress:return
++  preview=make_scan_previews(doc,nodes,folder,topology,[index])
++  if not preview:raise ValueError('Impossibile pubblicare anteprima: cartella esterna agli output del programma.')
++  item=preview[0];item['phase']=phase
++  item['redAnnotations']=[{'text':note['text'],'box':note['bbox'],'catalogueMatch':note['catalogueMatch']} for note in notes if note['page']==index+1]
++  live_pages[index]=item
++  update(phase,percent,message,previewPages=list(live_pages.values()),currentPage=index+1,totalPages=len(doc),nodesDetected=len(nodes))
++ update('apertura',2,'Apro il PDF e controllo le pagine.')
++ doc=pymupdf.open(stream=raw,filetype='pdf')
++ if len(doc)>150:raise ValueError('Limite alpha: 150 pagine PDF.')
++ if len(doc):publish_page(0,[],[],'lettura',3,'Documento aperto: visualizzo la prima pagina mentre controllo i requisiti.')
++ settings=dict(settings);initial_settings=dict(settings);word_cache={};requirements=None
++ # Board requirements must be known before choosing the first breaker family.
++ for index in range(min(3,len(doc))):
++  update('requisiti',4+3*index,'Verifico i requisiti generali prima di classificare gli apparecchi.')
++  words=spans(doc[index]);req=extract_requirements(words,index+1)
++  if req is None:
++   words=raster_spans(doc[index],folder,index,False);word_cache[index]=words
++   req=extract_requirements(words,index+1)
++  if req:
++   requirements=req;settings=apply_requirements(req,settings);break
++ red_vision={}
++ nodes=[];notes=[];messages=[];counts=collections.Counter();topology_records=[];unresolved_components=[];equipment_candidates=[];protective_networks=[];measurement_assemblies=[]
++ for page_index,page in enumerate(doc):
++  publish_page(page_index,nodes,notes,'lettura',8+60*page_index/max(1,len(doc)),f'Pagina {page_index+1}/{len(doc)} · separo annotazioni, etichette e tratti grafici.')
++  protective_networks.extend(protective_earth_from_page(page,page_index+1))
++  ss=spans(page);w,h=page.rect.width,page.rect.height;lines=vector_lines(page)
++  if not any(s['color']==0xff0000 for s in ss):
++   # Articoli rossi solo raster: ritagli rossi -> OCR -> Claude vision sui soli dubbi -> listino.
++   red_spans=rossi_vision.leggi_pagina(page,TESSERACT,statistiche=red_vision.setdefault(page_index+1,{}))
++   ss+=red_spans or raster_spans(page,folder,page_index,red_only=True)
++  unresolved_components.extend(collect_components(ss,page_index+1))
++  headers=[s for s in ss if re.fullmatch(r'[1-9]\d?',s['text']) and s['box'][1]<h*.15 and s['box'][0]>w*.17]
++  axes=sorted(set(round((s['box'][0]+s['box'][2])/2,1) for s in headers))
++  codes=[];accessories=[]
++  for s in ss:
++   color=s['color'];red=((color>>16)&255)>150 and ((color>>8)&255)<100 and (color&255)<100
++   if not red:continue
++   mentioned=re.findall(r'\b[A-Z][A-Z0-9]{4,15}(?:/[A-Z0-9]+)?\b',s['text'].upper())
++   matched=[a for a in mentioned if a in CAT or a in STANDARD_COMPONENTS]
++   notes.append({'page':page_index+1,'text':s['text'],'bbox':s['box'],'catalogueMatch':bool(matched),'catalogueArticles':matched,'unmatchedArticles':[a for a in mentioned if a not in CAT and a not in STANDARD_COMPONENTS]})
++   for article in re.findall(r'\b[A-Z][A-Z0-9]{4,15}(?:/[A-Z0-9]+)?\b',s['text'].upper()):
++    if article in CAT:
++     kind=classify(CAT[article]['descrizione'])
++     if kind in ['MT','MTD','RCD','QS']:codes.append((article,s))
++     elif kind=='MOD_DIFF':accessories.append((article,s))
++  # Le annotazioni FreeText non compaiono in spans(): entrano come note da verificare, mai come apparecchi confermati.
++  for ann in annotation_articles(page):
++   missing=[{'article':v['codice'],'suggestions':v['suggerimenti']} for v in ann['verifiche'] if not v['esiste']]
++   notes.append({'page':page_index+1,'text':ann['testo'],'bbox':ann['rect'],'source':'annotazione','catalogueMatch':not missing,'catalogueArticles':[v['codice'] for v in ann['verifiche'] if v['esiste']],'unmatchedArticles':[m['article'] for m in missing],'toConfirm':missing,'kinds':ann['tipi'],'breakerWithRcd':ann['unita_mt_diff']})
++  publish_page(page_index,nodes,notes,'codici',10+60*page_index/max(1,len(doc)),f'Pagina {page_index+1}/{len(doc)} · annotazioni rosse individuate; associo gli apparecchi.')
++  unknown={(p['article'],tuple(p['span']['box'])):p for p in unknown_switches(page,ss,axes)}
++  codes.extend((p['article'],p['span']) for p in unknown.values())
++  image=None;page_nodes=[];groups=collections.defaultdict(list);axis_evidence={};contact_edges=switch_segments(page) if codes else []
++  for article,s in codes:
++   center=(s['box'][0]+s['box'][2])/2;axis=min(axes,key=lambda x:abs(x-center)) if axes else center
++   if (article in CAT and classify(CAT[article]['descrizione'])=='QS') or (article,tuple(s['box'])) in unknown:
++    geometry=locate_switch(page,axes,s['box'],contact_edges)
++    if geometry:
++     axis=geometry['axis'];axis_evidence[(article,tuple(s['box']))]=geometry
++   groups[axis].append((article,s))
++  schedule_centers=schedule_column_centers(page) if groups else [];snap_evidence={}
++  if len(schedule_centers)>=4:
++   remapped=collections.defaultdict(list)
++   for axis,group in groups.items():
++    center=min(schedule_centers,key=lambda x:abs(x-axis))
++    if abs(center-axis)<=36:
++     remapped[center].extend(group);snap_evidence[center]=axis
++    else:remapped[axis].extend(group)
++   groups=remapped;axes=sorted(groups)
++  # Red article callouts can be real PDF text while the circuit schedule itself
++  # is a single embedded scan. In that mixed case, OCR only the compact label
++  # area first; previously we looked exclusively at native text, so a perfectly
++  # legible raster schedule silently produced empty fields for every feeder.
++  raster_schedule=len(schedule_centers)>=7
++  table_words=ss
++  label_tokens=('denominazione','curva','poli','formazione','lung')
++  native_labels=any(any(token in s['text'].lower() for token in label_tokens) and s['box'][0]<w*.2 and s['box'][1]>h*.35 for s in ss)
++  if groups and not native_labels and TESSERACT.is_file():
++   raster_words=word_cache.get(page_index)
++   if raster_words is None:
++    raster_words=raster_spans(page,folder,page_index,False);word_cache[page_index]=raster_words
++   table_words=ss+raster_words
++  outline_table=outlined_schedule(page,table_words,lines) if groups and not native_labels and not raster_schedule else None
++  if outline_table:
++   table_words=refine_outlined_tokens(page,table_words,outline_table,folder,page_index)
++   remapped=collections.defaultdict(list)
++   for axis,group in groups.items():
++    labelled_cells=[(a,b) for a,b in outline_table['cells'] if len(re.findall(r'[A-Za-zÀ-ÿ]',outlined_label(table_words,outline_table,(a+b)/2)[0]))>=4]
++    cell_bounds=min(labelled_cells,key=lambda bounds:abs(sum(bounds)/2-axis),default=None)
++    center=sum(cell_bounds)/2 if cell_bounds and abs(sum(cell_bounds)/2-axis)<(cell_bounds[1]-cell_bounds[0])*.8 else axis
++    remapped[center].extend(group)
++   groups=remapped;axes=sorted(groups)
++  row=lambda token:next(((s['box'][1]+s['box'][3])/2 for s in table_words if token.lower() in s['text'].lower() and s['box'][0]<w*.2),None)
++  # Schedule headings describe the row ABOVE its values. Use the table's
++  # circuit-name heading rather than a cover/header occurrence of “Descrizione”.
++  if raster_schedule:
++   description_y=row('Denominazione') or row('Descrizione');current_y=row('Poli x In') or row('Curva')
++   curve_y=row('Curva/Sganciatori') or row('Curva');ka_y=row('P.D.I.') or row('Pdi')
++   voltage_y=row('Vn (V)') or row('V (V)');formation_y=row('Formazione');length_y=row('Lunghezza') or row('Lung.')
++   idn_y=row('Soglia Id') or row('In (A)');delay_y=row('Ritardo') or row('TAR At')
++   # This raster schedule labels each ruled row above its values.
++   description_y=description_y+8 if description_y is not None else None
++   current_y=current_y+8 if current_y is not None else None
++   curve_y=curve_y+8 if curve_y is not None else None
++   ka_y=ka_y+8 if ka_y is not None else None
++   voltage_y=voltage_y+8 if voltage_y is not None else None
++   formation_y=formation_y+8 if formation_y is not None else None
++   length_y=length_y+8 if length_y is not None else None
++   idn_y=idn_y+8 if idn_y is not None else None
++   delay_y=delay_y+8 if delay_y is not None else None
++  else:
++   description_y=(outline_table['top']+outline_table['bottom'])/2 if outline_table else row('Descrizione');current_y=row('Poli x In');curve_y=row('Curva/Sganciatori');ka_y=row('P.D.I.')
++   voltage_y=row('Vn (V)');formation_y=row('Formazione');length_y=row('Lunghezza');idn_y=row('Soglia Id');delay_y=row('Ritardo')
++  cable_y=next(((s['box'][1]+s['box'][3])/2 for s in ss if s['text']=='Tipo' and s['box'][0]<w*.2 and s['box'][1]>h*.85),None)
++  class_y=next(((s['box'][1]+s['box'][3])/2 for s in ss if s['text']=='Classe' and idn_y and idn_y<s['box'][1]<idn_y+25),None)
++  if groups and description_y and TESSERACT.is_file():
++   pix=page.get_pixmap(matrix=pymupdf.Matrix(4,4),alpha=False);image=Image.frombytes('RGB',[pix.width,pix.height],pix.samples)
++  for axis,group in sorted(groups.items()):
++   article,s=group[0];unknown_key=(article,tuple(s['box']));unlisted=unknown_key in unknown
++   product=specs(article,CAT[article]) if not unlisted else {'kind':'QS','current':None,'description':'Articolo non presente nel catalogo; funzione proposta da contatto aperto del progetto','diff_mA':None}
++   kind=product['kind'];prefix='QS' if kind=='QS' else 'QF';counts['POWER']+=1;sigla=prefix+str(counts['POWER']);label='Utenza da leggere';v={'articolo':article,'costruttore':'BTICINO'};warnings=['Sigla provvisoria generata con numerazione comune QS/QF; verificare quella del progetto.','Funzione identificata dal codice articolo rosso; confermare anche il simbolo.']
++   if unlisted:warnings[-1]='Funzione QS proposta dalla geometria del progetto, articolo sconosciuto conservato: verificare funzione e codice.'
++   span=min([abs(b-a) for a,b in zip(axes,axes[1:])],default=70)/2-2
++   def cell(y,half,key):return read_cell(image,(max(0,axis-span),max(0,y-half),min(w,axis-1 if key in ['voltage','cable'] else axis+span),min(h,y+half)),folder,f'{page_index}_{sigla}_{key}') if image and y else ''
++   label_raw='';label_review=None;label_ocr=None
++   if description_y:
++    if raster_schedule:
++     label_ocr=read_schedule_label(image,axis,span,description_y,folder,f'{page_index}_{sigla}_label')
++     label_raw=label_ocr.get('text','') or ' / '.join(r['raw'] for r in label_ocr.get('readings',[]) if r.get('raw'))
++    else:label_raw=' '.join(cell(description_y+4,4.5,'label').split())
++    candidate=re.split(r'\s*\|\s*',label_raw,1)[0].strip(' _-:;')
++    candidate=re.split(r'\b(?:230|240|380|400|415)\b',candidate,1)[0].strip(' _-:;')
++    if raster_schedule:
++     letters=len(re.findall(r'[A-Za-zÀ-ÿ]',candidate))
++     if letters>=4 and label_ocr and label_ocr.get('score',0)>=4:
++      label=candidate
++      label_review={'status':'proposed','raw':label_raw,'readings':label_ocr.get('readings',[]),'reason':'Denominazione OCR proposta: verificare sul PDF originale'}
++     else:
++      label='Utenza da verificare'
++      if label_raw:label_review={'status':'ambiguous','raw':label_raw,'readings':label_ocr.get('readings',[]) if label_ocr else [],'reason':'OCR da tabella raster non sufficientemente affidabile'}
++    elif len(re.findall(r'[A-Za-zÀ-ÿ]',candidate))>=4 and '\ufffd' not in candidate:label=candidate
++   if outline_table:
++    label_raw,label_ocr=outlined_label(table_words,outline_table,axis)
++    if len(re.findall(r'[A-Za-zÀ-ÿ]',label_raw))>=4:
++     label=label_raw
++     label_review={'status':'proposed','raw':label_raw,'reason':'OCR della cella delimitata da bordi vettoriali; verificare la denominazione sul PDF.'}
++   current=cell(current_y,3.7,'current').replace(' ','');match=re.search(r'(3P\+N|4P|1P\+N|2P|P\+N|3P|1P)[xX×/]?(\d+)',current,re.I)
++   if match:
++    poles={'3P+N':'4P','P+N':'1P+N'}.get(match[1].upper(),match[1].upper());amps=int(match[2]);v['taratura_progetto_letta']=poles+'/'+str(amps)+'A'
++    spec=conductor_spec(current)
++    if spec:v['conductorSpec']=spec
++   else:
++    v['taratura']=''
++    if product.get('current') is None:warnings.append('Poli e corrente non ricavabili dall’articolo rosso: completarli prima del DWG.')
++   curve=cell(curve_y,3.7,'curve');curve_match=re.fullmatch(r'([BCD])(?:/)?\d*',curve.strip());v['curva_Im']=''
++   # Never turn a stray scan token (often the breaker current from an adjacent
++   # row) into a curve or a kA rating. The red article supplies the selected
++   # device data; unresolved catalogue fields remain blank and are reviewed.
++   ka=cell(ka_y,3.7,'ka');v['potere_interruzione']='';raw_voltage=cell(voltage_y,3.7,'voltage');volt=re.search(r'\b(230|400|240|380|415)\b',raw_voltage);v['tensione']=volt[1]+'V' if volt else ''
++   cable=cell(cable_y,3.7,'cable');formation=cell(formation_y,3.7,'formation');length=cell(length_y,3.7,'length');field_review={'utenza':label_review} if label_review else {}
++   if ka.strip():field_review['potere_interruzione']={'status':'ambiguous','raw':ka,'reason':'lettura OCR tabellare non usata come dato di targa'}
++   if curve.strip() and not product.get('curve'):field_review['curva_Im']={'status':'ambiguous','raw':curve,'reason':'dato dell’interruttore non disponibile nel codice rosso/catalogo; OCR nero non usato come fonte'}
++   cable_token=re.search(r'\bFG[A-Z0-9()]+',cable.upper())
++   if cable_token:
++    candidate=cable_token[0].replace('FGI','FG1').replace('160M','16OM');v['tipo_cavo']=candidate
++    if candidate!=cable_token[0]:warnings.append('Tipo cavo proposto con normalizzazione OCR: controllare il testo originale.')
++   if formation:
++    proposed,alternatives,formation_reads=formation_proposals(folder,f'{page_index}_{sigla}_formation',formation)
++    if proposed:v['composizione_cavo']=proposed
++    else:
++     preview_file=(folder/f'{page_index}_{sigla}_formation.png').resolve();preview=None
++     if preview_file.is_relative_to(ROOT.resolve()):preview='/'+preview_file.relative_to(ROOT.resolve()).as_posix()
++     elif preview_file.is_relative_to(STUDIO.resolve()):preview='/assets/'+preview_file.relative_to(STUDIO.resolve()).as_posix()
++     field_review['composizione_cavo']={'status':'ambiguous','alternatives':alternatives,'raw':formation,'readings':formation_reads,'preview':preview}
++     warnings.append('Formazione cavo da verificare: '+(', '.join(alternatives) or 'nessuna lettura affidabile')+'. Controllare il dettaglio e compilare il dato.')
++   if re.fullmatch(r'\d+(?:[.,]\d+)?',length.strip()):v['lunghezza_m']=length.strip()
++   idn=cell(idn_y,3.7,'idn');dtype=cell(class_y,3.7,'dtype');delay=cell(delay_y,3.7,'delay')
++   if dtype.strip() in ['A','AC','F','B'] and re.fullmatch(r'\d+',idn.strip()):
++    v['differenziale']=dtype.strip()+'/'+f'{int(idn)/1000:g}'+('/IST.' if delay.strip()=='0' else '')
++   v['utenza']=label
++   ident=uuid.uuid4().hex[:12];evidence={'page':page_index+1,'articleBox':s['box'],'axis':axis,'articleSource':'annotazione rossa','labelSource':'OCR tabella' if image else 'da leggere','labelOcr':label_ocr,'catalogueDescription':product['description'],'pdf':url,'rawCells':{'label':label_raw,'current':current,'curve':curve,'ka':ka,'voltage':raw_voltage,'cable':cable,'formation':formation,'length':length,'idn':idn,'dtype':dtype,'delay':delay}}
++   if description_y:evidence['labelBox']=[max(0,axis-span),max(0,description_y-5),min(w,axis+span),min(h,description_y+12)]
++   if description_y and label=='Utenza da leggere':warnings.append('Denominazione non letta con sufficiente chiarezza: completare la linea in revisione.')
++   if outline_table:evidence.update(axisSource='vector_schedule_cell',scheduleCell=label_ocr.get('box') if label_ocr else None,labelSource='OCR cella vettoriale')
++   if axis in snap_evidence:evidence.update(axisSource='raster_schedule_grid',redCodeAxis=snap_evidence[axis],scheduleColumnCenters=schedule_centers)
++   if (article,tuple(s['box'])) in axis_evidence:evidence.update(axisSource='contact_geometry',symbolGeometry=axis_evidence[(article,tuple(s['box']))])
++   attached=[a for a,sa in accessories if abs((sa['box'][0]+sa['box'][2])/2-(s['box'][0]+s['box'][2])/2)<20 and abs(sa['box'][1]-s['box'][1])<90]
++   # Red quotation articles are the operator's selected equipment. When the
++   # scanned schedule is unreadable or conflicts, keep the scan as evidence but
++   # populate switch ratings from the red article's catalogue specification.
++   if product.get('poles') and product.get('current') is not None:
++    rated=str(product['poles'])+'/'+f'{product["current"]:g}A'
++    if v.get('taratura_progetto_letta') and v['taratura_progetto_letta']!=rated:
++     v['taratura_in_conflitto']=v['taratura_progetto_letta'];v['conflict_current']=True
++     warnings.append(f'Dubbio: tabella scansionata {v["taratura_progetto_letta"]}, articolo rosso {rated}. Applicata la specifica dell\'articolo rosso; verificare il conflitto.')
++    v['taratura']=rated;v['poli']=product['poles'];v['corrente_A']=product['current']
++    if product.get('curve'):v['curva_Im']=product['curve']
++   accessory_specs=[(a,specs(a,CAT[a])) for a in attached if a in CAT]
++   differential=next(((a,sp) for a,sp in accessory_specs if sp.get('kind')=='MOD_DIFF'),None)
++   if kind=='MT' and attached:kind='MTD';v['accessorio_a']=attached[0]
++   if differential and differential[1].get('diff_mA'):
++    differential_article,differential_spec=differential;desc=CAT.get(differential_article,{}).get('descrizione','')
++    dtype_match=re.search(r'(?:magn(?:etot)?\s*diff(?:erenziale)?\s+)(AC|A|F|B)\b',desc,re.I) or re.search(r'\b(AC|A|F|B)\s*$',desc,re.I);dtype=dtype_match[1].upper() if dtype_match else 'DA VERIF.'
++    v['differenziale']=dtype+'/'+str(differential_spec['diff_mA'])+'mA'
++    warnings.append('Tipo e soglia differenziale proposti dall’articolo rosso associato; verificare coerenza della coppia.')
++   elif product.get('diff_mA'):
++    desc=product.get('description','');dtype_match=re.search(r'(?:magn(?:etot)?\s*diff(?:erenziale)?\s+)(AC|A|F|B)\b',desc,re.I) or re.search(r'\b(AC|A|F|B)\s*$',desc,re.I);dtype=dtype_match[1].upper() if dtype_match else 'DA VERIF.'
++    v['differenziale']=dtype+'/'+str(product['diff_mA'])+'mA'
++   evidence['redArticleSpecification']={k:product.get(k) for k in ('description','kind','poles','current','curve','diff_mA','compatibility_family_kA')}
++   evidence['redAccessorySpecifications']=[{'article':a,'description':sp.get('description'),'kind':sp.get('kind'),'poles':sp.get('poles'),'current':sp.get('current'),'diff_mA':sp.get('diff_mA')} for a,sp in accessory_specs]
++   if outline_table:
++    designations=[word for word in table_words if re.fullmatch(r'Q[A-Z]{0,3}[0-9]{0,3}',word['text']) and len(word['text'])>=2 and abs((word['box'][0]+word['box'][2])/2-axis)<30 and s['box'][1]-55<word['box'][1]<s['box'][1]]
++    if len(designations)==1 and not any(n['sigla']==designations[0]['text'] for n in nodes+page_nodes):
++     evidence['siglaSource']={'method':'OCR near device column','box':designations[0]['box'],'generatedFallback':sigla,'status':'proposed'}
++     sigla=designations[0]['text']
++     warnings[0]='Sigla rilevata vicino al simbolo nel PDF: confermare la lettura.'
++   cable_readings=[]
++   for cable_key,heading,raw_value,caption,crop_key in [('tipo_cavo',cable_y,cable,'Tipo di cavo','cable'),('composizione_cavo',formation_y,formation,'Formazione cavo','formation')]:
++    if heading is None:continue
++    box=[max(0,axis-span),max(0,heading-3.7),min(w,axis-1 if crop_key=='cable' else axis+span),min(h,heading+3.7)]
++    proposed=v.get(cable_key,'')
++    status='ambiguous' if field_review.get(cable_key,{}).get('status')=='ambiguous' or not proposed else 'proposed'
++    cable_readings.append({'field':cable_key,'caption':caption,'box':box,'raw':raw_value,'value':proposed,'status':status})
++   evidence['cableReadings']=cable_readings
++   node={'id':ident,'sigla':sigla,'kind':kind,'label':label,'articles':[article]+attached,'values':v,'fieldReview':field_review,'parent':None,'confirmed':False,'connectionConfirmed':False,'warnings':warnings,'evidence':evidence,'x':40,'y':40,'imported':True};page_nodes.append(node)
++   if unlisted:
++    node['requiresTechnicalReview']=True;node['selectionError']=True
++    evidence['functionSource']='geometria PDF, funzione da confermare'
++    evidence['symbolGeometry']=unknown[unknown_key]['geometry']
++    for component in unresolved_components:
++     if component['article']==article and component['page']==page_index+1 and tuple(component['box'])==tuple(s['box']):
++      component['linkedPowerNode']=ident
++      component['integrationStatus']='funzione_proposta_articolo_da_verificare'
++   publish_page(page_index,nodes+page_nodes,notes,'etichette',10+60*page_index/max(1,len(doc)),f'Pagina {page_index+1} · {sigla}: {label}')
++   if cable_readings:
++    publish_page(page_index,nodes+page_nodes,notes,'cavi',11+60*page_index/max(1,len(doc)),f'Pagina {page_index+1} · {sigla}: tipo e formazione cavo letti, da verificare.')
++  page_nodes.extend(detect_contactors(page,ss,axes,unresolved_components,folder,page_index,counts,url))
++  attach_catalogued_auxiliaries(page_nodes,unresolved_components,page_index)
++  attach_catalogued_symbols(page_nodes,unresolved_components,page_index)
++  typed_nodes=False
++  if not page_nodes:
++   typed_nodes=True
++   if page_index not in word_cache:word_cache[page_index]=raster_spans(page,folder,page_index,False)
++   page_nodes=breaker_columns_without_codes(page,folder,page_index,settings,counts,url,word_cache[page_index])
++   if page_nodes:
++    ref_words=refine_page_references(page,word_cache[page_index],folder,page_index)
++    topology_records.append({'page':page_index+1,'trace':trace_page(page_nodes,lines,ref_words,w,h,junctions=junctions(page))})
++  if not typed_nodes:
++   feeder_proposals(page_nodes,lines,w,h)
++   signals=read_signal_arrows(page,folder,page_index,TESSERACT) if page_nodes else []
++   topology_records.append({'page':page_index+1,'trace':trace_page(page_nodes,lines,ss,w,h,signals,junctions(page))})
++  publish_page(page_index,nodes+page_nodes,notes,'linee',12+60*page_index/max(1,len(doc)),f'Pagina {page_index+1} · reti di fili tracciate; collegamenti ancora da confermare.',{'pageTraces':topology_records})
++  page_networks=[network for network in protective_networks if network['page']==page_index+1]
++  page_trace=next((record['trace'] for record in topology_records if record['page']==page_index+1),{})
++  measurement_assemblies.extend(detect_measurement(page,unresolved_components,page_nodes,page_trace))
++  attach_measurement_fuses(page,measurement_assemblies,unresolved_components)
++  if page_networks:trace_earth_outlets(page_networks,earth_segments(page),page_trace.get('ports',{}),junctions(page))
++  equipment_candidates.extend(collect_evidence(ss+word_cache.get(page_index,[]),page_index+1))
++  nodes.extend(page_nodes)
++  publish_page(page_index,nodes,notes,'interpretata',8+60*(page_index+1)/max(1,len(doc)),f'Pagina {page_index+1}/{len(doc)} · {len(page_nodes)} apparecchi candidati, {len(unresolved_components)} componenti accessori da controllare.',{'pageTraces':topology_records})
++  if not page_nodes:messages.append(f'Pagina {page_index+1}: nessun apparecchio identificato tramite articolo rosso. Riconoscimento dei simboli senza codici ancora da completare.')
++ for node in nodes:
++  if node['kind'] not in ['MT','MTD']:continue
++  try:
++   node['ratingReview']={'status':'documented',**validate_device_rating(node,settings)}
++  except ValueError as error:
++   node['ratingReview']={'status':'blocked','message':str(error)}
++   node['warnings'].append('Verifica kA: '+str(error))
++ if os.environ.get('BTICINO_DEBUG_TOPOLOGY'):
++  import json as _json;open(os.environ['BTICINO_DEBUG_TOPOLOGY'],'w',encoding='utf-8').write(_json.dumps(topology_records,default=str))
++ topology=connect_pages(topology_records,nodes) if topology_records else None
++ if topology_records:
++  from unwired_siblings import adotta as adopt_unwired
++  adopt_unwired(nodes)
++ # Raster schedules can still expose bus segments after vector geometry has
++ # been flattened. Treat each uninterrupted segment as evidence; never infer
++ # that every device on a sheet is downstream of the largest breaker.
++ raster_topology=[]
++ for page_index,page in enumerate(doc):
++  page_nodes=[n for n in nodes if int(n.get('evidence',{}).get('page',0))==page_index+1]
++  if not page_nodes or not all(n.get('evidence',{}).get('axisSource')=='raster_schedule_grid' for n in page_nodes):continue
++  bus=raster_bus_evidence(page,page_nodes)
++  if not bus:continue
++  by_axis=sorted(page_nodes,key=lambda n:float(n.get('evidence',{}).get('axis',0)))
++  labelled=[n for n in page_nodes if re.search(r'\b(?:GENERALE|QUADRO)\b',n.get('label',''),re.I)]
++  root=None
++  if len(labelled)==1:
++   root=labelled[0]
++   if not re.search(r'\bGENERALE\b',root.get('label',''),re.I):
++    ratings=[]
++    for n in page_nodes:
++     match=re.search(r'/\s*([\d.]+)\s*A',n.get('values',{}).get('taratura',''))
++     if match:ratings.append((float(match[1]),n))
++    if not ratings or max(ratings,key=lambda item:item[0])[1]['id']!=root['id']:root=None
++  proposals=[]
++  if root:
++   root_axis=float(root['evidence']['axis'])
++   # A separate segment upstream of the general stays a parallel incoming
++   # protection branch (for example an SPD); downstream segments alone become
++   # children of the general.
++   incoming=next((s for s in bus['segments'] if root['id'] in s['devices']),None)
++   if incoming:
++    upstream=[n for n in page_nodes if n['id'] in incoming['devices']]
++    source_group=f'RASTER_INCOMING_PAGE_{page_index+1}'
++    for n in upstream:
++     n['parent']=None;n['connectionStatus']='da_definire';n['imported']=True
++     n.setdefault('values',{})['externalSupplyGroup']=source_group
++     n['values']['externalSupplyLabel']='ARRIVO LINEA · DA VERIFICARE'
++     n['connectionReview']={'status':'proposed','source':'raster_horizontal_bus_segment','page':page_index+1,'segment':incoming,'parent':None,'reason':'Ramo sulla barra di arrivo distinta, parallelo al generale; confermare continuità e funzione.'}
++     n.setdefault('warnings',[]).append('Barra di arrivo proposta; ramo parallelo al generale da confermare sul PDF.')
++    for segment in bus['segments']:
++     ids=segment['devices']
++     if segment['x0']<=root_axis+8 or len(ids)<3:continue
++     children_on_segment=[n for n in page_nodes if n['id'] in ids and n['id']!=root['id']]
++     if len(children_on_segment)<3:continue
++     for child in children_on_segment:
++      child['parent']=root['id'];child['connectionStatus']='raster_bus_proposal';child['imported']=True
++      child['connectionReview']={'status':'proposed','source':'raster_horizontal_bus_segment','page':page_index+1,'segment':segment,'parent':root['id'],'reason':'Il ramo interseca una dorsale raster distinta a valle del generale; confermare il collegamento.'}
++      child.setdefault('warnings',[]).append('Collegamento alla dorsale a valle proposto dalla geometria raster; confermare sul PDF.')
++      proposals.append(child['id'])
++    root.setdefault('evidence',{})['generalDetection']={'status':'proposed','source':'OCR denomination + red article rating','rationale':'Etichetta del generale e segmenti raster distinti a monte e a valle.'}
++   else:
++    root=None
++  if not root:
++   # A bus continuing across a raster schedule can be represented as one
++   # shared, unconfirmed feed without inventing a device as its parent.
++   supported={ident for segment in bus['segments'] for ident in segment['devices']}
++   if len(supported)>=max(4,round(len(page_nodes)*.6)):
++    source_group=f'RASTER_CONTINUATION_PAGE_{page_index+1}'
++    for n in page_nodes:
++     n['parent']=None;n['connectionStatus']='da_definire';n['imported']=True
++     n.setdefault('values',{})['externalSupplyGroup']=source_group
++     n['values']['externalSupplyLabel']='CONTINUITÀ ALIMENTAZIONE · DA VERIFICARE'
++     direct=n['id'] in supported
++     n['connectionReview']={'status':'proposed','source':'raster_horizontal_bus_segments','page':page_index+1,'segments':[s for s in bus['segments'] if n['id'] in s['devices']],'parent':None,'directIntersection':direct,'reason':'Dorsale comune proposta dalla copertura geometrica; continuità tra segmenti e rimando di pagina da confermare.' if direct else 'Il ramo non interseca direttamente un segmento rilevato; è incluso solo nella proposta di dorsale comune e richiede verifica visiva.'}
++     n.setdefault('warnings',[]).append('Alimentazione comune/continuazione proposta; verificare la dorsale, i rami e la freccia/catenaria tra pagine.')
++     proposals.append(n['id'])
++  if proposals:raster_topology.append({'page':page_index+1,'root':root['id'] if root else None,'children':proposals,'bus':bus})
++ associate_contactor_labels(nodes)
++ if topology:topology['pageTraces']=topology_records
++ if topology is None and raster_topology:topology={'method':'vector_topology_plus_raster_bus_proposals','rasterProposals':raster_topology,'pageTraces':topology_records}
++ elif topology and raster_topology:topology['rasterProposals']=raster_topology
++ project={'schemaVersion':1,'name':pathlib.Path(name).stem,'settings':settings,'nodes':nodes,'sourcePdf':url,'equipmentCandidates':equipment_candidates,'importReview':{'pages':len(doc),'nodes':len(nodes),'messages':messages,'method':'red article + table OCR + vector wires + layout-neutral textual candidates','completeRecognition':False,'topology':topology,'redVision':red_vision}}
++ update('rete_e_controlli',82,'Ricompongo i segmenti di alimentazione e controllo le associazioni.')
++ project['scanPreview']=make_scan_previews(doc,nodes,folder,topology)
++ for item in project['scanPreview']:
++  item['phase']='rete_verificata'
++  item['redAnnotations']=[{'text':note['text'],'box':note['bbox'],'catalogueMatch':note['catalogueMatch']} for note in notes if note['page']==item['page']]
++ update('anteprime',96,'Verifica finale delle evidenze sovrapposte al PDF.',previewPages=project['scanPreview'],currentPage=len(doc),totalPages=len(doc),nodesDetected=len(nodes))
++ if protective_networks:project['protectiveNetworks']=protective_networks
++ if measurement_assemblies:project['measurementAssemblies']=measurement_assemblies
++ if requirements:
++  requirements['previousSettings']=initial_settings;project['boardRequirements']=requirements
++  messages.insert(0,f'Requisiti kA rilevati a pagina {requirements["page"]}: confermare prima del DWG.')
++ if unresolved_components:
++  project['unresolvedComponents']=unresolved_components
++  messages.insert(0,f'{sum(c["requiresIntegration"] for c in unresolved_components)} componenti aggiuntivi individuati, da classificare o integrare prima del definitivo.')
++ update('completato',100,f'Analisi terminata: {len(nodes)} apparecchi proposti; le decisioni restano da verificare.')
++ return {'pages':len(doc),'redNotes':notes,'preview':url,'project':project,'message':f'{len(nodes)} apparecchi proposti. Verificare etichette, sigle, dati e alimentazioni. '+(' '.join(messages))}
++
+--- a/Alpha/pdf_signal_references.py
++++ b/Alpha/pdf_signal_references.py
+@@ -66,7 +66,7 @@
+             file=folder/f'signal_{page_index}_{role}_{key[0]}_{key[1]}.png';im.save(file)
+             reads=[];all_reads=[];vector_letter=stroke_letter(page,box)
+             for mode in [7,10]:
+-                run=subprocess.run([str(tesseract),str(file),'stdout','--psm',str(mode),'-c','tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ','tsv'],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,creationflags=subprocess.CREATE_NO_WINDOW,timeout=15)
++                run=subprocess.run([str(tesseract),str(file),'stdout','--psm',str(mode),'-c','tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ','tsv'],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0),timeout=15)
+                 tokens=[r for r in csv.DictReader(io.StringIO(run.stdout.decode('utf-8',errors='replace')),delimiter='\t') if r.get('text','').strip()]
+                 if len(tokens)==1 and re.fullmatch('[A-Z]',tokens[0]['text']):
+                     all_reads.append(tokens[0]['text'])
+@@ -124,7 +124,7 @@
+                     im=ImageOps.expand(im.crop(ink),border=24,fill=255)
+                     file=folder/f'flag_{page_index}_{role}_{key[0]}.png';im.save(file)
+                     for mode in (7,10):
+-                        run=subprocess.run([str(tesseract),str(file),'stdout','--psm',str(mode),'-c','tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ','tsv'],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,creationflags=subprocess.CREATE_NO_WINDOW,timeout=15)
++                        run=subprocess.run([str(tesseract),str(file),'stdout','--psm',str(mode),'-c','tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ','tsv'],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0),timeout=15)
+                         tokens=[r for r in csv.DictReader(io.StringIO(run.stdout.decode('utf8',errors='replace')),delimiter='\t') if r.get('text','').strip()]
+                         if len(tokens)==1 and re.fullmatch('[A-Z]',tokens[0]['text']) and float(tokens[0]['conf'])>=60:reads.append(tokens[0]['text'])
+                 if len(reads)==2 and reads[0]==reads[1]:
+--- /dev/null
++++ b/Alpha/unwired_siblings.py
+@@ -0,0 +1,62 @@
++"""Apparecchi di riserva senza filo disegnato verso la barra.
++
++Nel progetto una riserva (es. ``RISERVA``) puo' avere il solo simbolo, senza il
++conduttore che sale alla barra. Il tracciamento geometrico la lascia senza
++alimentazione, mentre elettricamente sta sulla barra delle utenze vicine.
++Qui la proponiamo come figlia dello stesso padre del blocco adiacente, sullo
++stesso foglio e dello stesso tipo, sempre da confermare. Nessun apparecchio con
++un filo di ingresso riconosciuto viene toccato.
++"""
++from __future__ import annotations
++
++MOTIVO = 'Riserva senza conduttore disegnato: alimentazione ereditata dal blocco adiacente dello stesso tipo. Confermare.'
++
++
++def _pagina(nodo: dict):
++    return nodo.get('evidence', {}).get('page')
++
++
++def _asse(nodo: dict):
++    return nodo.get('evidence', {}).get('axis')
++
++
++def _discendenti(nodi: list[dict], radice: str) -> set[str]:
++    trovati = {radice}
++    cambiato = True
++    while cambiato:
++        cambiato = False
++        for n in nodi:
++            if n.get('parent') in trovati and n['id'] not in trovati:
++                trovati.add(n['id'])
++                cambiato = True
++    return trovati
++
++
++def adotta(nodi: list[dict]) -> list[str]:
++    """Assegna un padre proposto alle riserve orfane. Restituisce gli id modificati."""
++    modificati = []
++    for nodo in nodi:
++        if nodo.get('parent') or nodo.get('connectionStatus') != 'da_definire':
++            continue
++        if nodo.get('evidence', {}).get('connectionTrace'):
++            continue
++        asse = _asse(nodo)
++        if asse is None:
++            continue
++        vicini = [m for m in nodi
++                  if m is not nodo and m.get('parent') and _pagina(m) == _pagina(nodo)
++                  and m.get('kind') == nodo.get('kind') and _asse(m) is not None]
++        if not vicini:
++            continue
++        sinistri = [m for m in vicini if _asse(m) < asse]
++        scelto = max(sinistri, key=_asse) if sinistri else min(vicini, key=lambda m: abs(_asse(m) - asse))
++        if scelto['parent'] in _discendenti(nodi, nodo['id']):
++            continue
++        nodo['parent'] = scelto['parent']
++        nodo['connectionStatus'] = 'proposta_da_adiacenza'
++        nodo['connectionConfirmed'] = False
++        nodo['connectionReview'] = {'status': 'proposed', 'reason': MOTIVO}
++        nodo.setdefault('warnings', []).append(MOTIVO)
++        modificati.append(nodo['id'])
++    return modificati
++
 --- a/strumenti/report_golden.py
 +++ b/strumenti/report_golden.py
 @@ -61,9 +61,11 @@
@@ -387,6 +2189,44 @@
 +    p['nodes'].append({'id': 'h', 'sigla': 'QS9', 'parent': None, 'values': {}})
 +    with pytest.raises(ValueError):
 +        mp.posiziona(p, [{'modo': 'downstream_general', 'strumento': 'MFD4421'}])
+--- /dev/null
++++ b/tests/test_unwired_siblings.py
+@@ -0,0 +1,35 @@
++import unwired_siblings as us
++
++
++def _n(ident, x, parent=None, kind='MTD', page=18, status=None, trace=False):
++    nodo = {'id': ident, 'kind': kind, 'parent': parent, 'evidence': {'page': page, 'axis': x},
++            'connectionStatus': status or ('da_definire' if not parent else 'proposta_da_vettori_e_rimandi_reciproci')}
++    if trace:
++        nodo['evidence']['connectionTrace'] = {'method': 'x'}
++    return nodo
++
++
++def test_riserva_eredita_padre_del_vicino_a_sinistra():
++    nodi = [_n('p', 50, kind='QS', page=7), _n('a', 263, 'p'), _n('b', 345, 'p'), _n('r1', 427), _n('r2', 508)]
++    nodi[0]['evidence']['page'] = 18
++    assert us.adotta(nodi) == ['r1', 'r2']
++    assert nodi[3]['parent'] == 'p' and nodi[4]['parent'] == 'p'
++    assert nodi[3]['connectionStatus'] == 'proposta_da_adiacenza'
++    assert nodi[3]['connectionReview']['status'] == 'proposed'
++
++
++def test_non_tocca_chi_ha_un_trace():
++    nodi = [_n('p', 50, kind='QS'), _n('a', 263, 'p'), _n('r', 427, trace=True)]
++    assert us.adotta(nodi) == []
++    assert nodi[2]['parent'] is None
++
++
++def test_tipo_diverso_non_adottato():
++    nodi = [_n('p', 50, kind='QS'), _n('a', 263, 'p', kind='QS'), _n('r', 427, kind='MTD')]
++    assert us.adotta(nodi) == []
++
++
++def test_padre_su_altro_foglio_ammesso_per_barre_che_proseguono():
++    nodi = [_n('p', 50, kind='QS', page=7), _n('a', 263, 'p', page=18), _n('r', 427, page=18)]
++    assert us.adotta(nodi) == ['r']
++    assert nodi[2]['parent'] == 'p'
 --- a/Alpha/frontend/src/hierarchy.ts
 +++ b/Alpha/frontend/src/hierarchy.ts
 @@ -79,7 +79,8 @@
