@@ -1,0 +1,730 @@
+--- a/Alpha/engine.py
++++ b/Alpha/engine.py
+@@ -227,8 +227,6 @@
+  has_front=project.get('hasMhq') is not False and bool(project.get('mhq',{}).get('exportId'))
+  from cover_page import reserve_front_pages,append_title_cover,append_index,project_metadata,fit_title_attribute
+  reserve_front_pages(pages,positions)
+- if any(children[r.get('measuredFeeder')] for r in project.get('measurementAssemblies',[])):
+-  raise ValueError('Misura su alimentazione con derivazioni interne: instradamento del primario ancora da integrare. La bozza non puo bypassare il TA.')
+  measurement_feeders=set(measurement_groups)
+  total_pages=len(pages)+2+int(has_front)
+  destinations=collections.defaultdict(list)
+@@ -275,7 +273,8 @@
+    parent=group['parent'];items=group['items'];bus_y=sy+group['bus_y'];first_x=items[0]['x'] if items else group['incoming_x'];last_x=group['last_x']
+    if parent and positions[parent]['page']==physical:
+     px=positions[parent]['x'];lane=packed['lanes'][parent]
+-    line((px,sy+142.5),(lane,sy+142.5));line((lane,sy+142.5),(lane,bus_y));line((lane,bus_y),(last_x,bus_y))
++    start_x=px+125 if parent in measurement_groups else px
++    line((start_x,sy+142.5),(lane,sy+142.5));line((lane,sy+142.5),(lane,bus_y));line((lane,bus_y),(last_x,bus_y))
+    elif parent:
+     line((group['incoming_x'],bus_y),(last_x,bus_y))
+    elif len(items)==1 and packed['external_column'] is not None:
+@@ -351,8 +350,7 @@
+    elif phase:text(phase,x+7,sy+175,1.6)
+    if not children[n['id']] and n['id'] not in measurement_feeders:m.add_circle((x,sy+142.5),1.2)
+    if n['id'] in measurement_groups:
+-    if feed_group['bus_y']<250:raise ValueError('Misura su barra troppo bassa: instradamento da completare senza sovrapposizioni.')
+-    drawn_measurements.append(draw_measurement(doc,measurement_groups[n['id']],x,sy,text,line,n,fieldrows))
++    drawn_measurements.append(draw_measurement(doc,measurement_groups[n['id']],x,sy,text,line,n,fieldrows,ceiling=sy+min(249,feed_group['bus_y']-6)))
+    if is_inline:continue # Contact attributes retain its own article; one circuit cartiglio.
+    text(n['sigla'],x,sy+127.5)
+    for k,y in fieldrows.items():
+--- a/Alpha/packing.py
++++ b/Alpha/packing.py
+@@ -33,7 +33,7 @@
+    pages.append(page);reserved,external=source_reservation(this_sheet);page={'items':[],'lanes':{},'start_column':reserved,'external_column':external};column=reserved
+   row={'id':ident,'column':column,'x':80+25*column,'grid':GRID[column],'span':span};page['items'].append(row)
+   positions[ident]={**row,'page':len(pages)+1}
+-  if children[ident]:page['lanes'][ident]=80+25*(column+1)
++  if children[ident]:page['lanes'][ident]=80+25*(column+span)
+   column+=width
+  if page['items']:pages.append(page)
+  grouped_pages=[]
+--- a/Alpha/server.py
++++ b/Alpha/server.py
+@@ -67,6 +67,12 @@
+    if length>70_000_000:raise ValueError('File troppo grande.')
+    data=json.loads(self.rfile.read(length));path=urllib.parse.urlparse(self.path).path
+    if path=='/api/learning/correction':return self.send_json(record_learning_correction(data.get('entry')))
++   if path=='/api/measurement/options':
++    from measurement_placement import opzioni
++    return self.send_json(opzioni(data['project']))
++   if path=='/api/measurement/place':
++    from measurement_placement import posiziona
++    return self.send_json({'project':posiziona(data['project'],data.get('placements',[]))})
+    if path=='/api/select':return self.send_json(select_device(data['request'],data['settings']))
+    if path=='/api/save':
+     p=data['project'];key=data.get('id') or uuid.uuid4().hex[:10];target=safe(key+'.json',PROJECTS);target.write_text(json.dumps(p,ensure_ascii=False,indent=2),encoding='utf-8');reply={'id':key,'name':p.get('name','Progetto')}
+--- a/Alpha/measurement_composition.py
++++ b/Alpha/measurement_composition.py
+@@ -19,8 +19,10 @@
+    r.update(ports={p['id']:p['xy'] for p in meta['ports']},block=meta['id'],topAligned=meta['topAligned'])
+  return groups
+ 
+-def draw(doc,group,x,sy,text,line,source,fieldrows):
+- m=doc.modelspace();r=group['assembly'];ports=group['ports'];origin=(x+20,sy+249-ports['PRIMARY_OUT'][1]) if group.get('topAligned') else (x+20,sy+159)
++def draw(doc,group,x,sy,text,line,source,fieldrows,ceiling=None):
++ m=doc.modelspace();r=group['assembly'];ports=group['ports'];top_y=sy+249 if ceiling is None else ceiling
++ if group.get('topAligned') and top_y<sy+249:raise ValueError('Misura su barra troppo bassa per questo strumento: scegliere il modulo con TA o spostare la misura.')
++ origin=(x+20,top_y-ports['PRIMARY_OUT'][1]) if group.get('topAligned') else (x+20,sy+159)
+  values={a.dxf.tag:'?' for a in doc.blocks.get(group['block']).query('ATTDEF')}
+  values.update(SIGLA_MISURA=group['sigla'],SIGLA_PROTEZIONE=group['protectionSigla'],RAPPORTO_TA=str(r.get('ratio') or '?'),QUANTITA_TA=str(r.get('quantity') or '?'))
+  ref=insert(m,origin,values,group['block'])
+@@ -29,10 +31,11 @@
+  bottom=ports['PRIMARY_IN'];top=ports['PRIMARY_OUT']
+  bottom=(origin[0]+bottom[0],origin[1]+bottom[1]);top=(origin[0]+top[0],origin[1]+top[1])
+  line((x,sy+142.5),(bottom[0],sy+142.5));line((bottom[0],sy+142.5),bottom)
+- if top[1]<sy+249:line(top,(top[0],sy+249))
+- line((top[0],sy+249),(x+125,sy+249));line((x+125,sy+249),(x+125,sy+142.5));m.add_circle((x+125,sy+142.5),1.2)
++ if top[1]>top_y+.01:raise ValueError('Misura su barra troppo bassa: instradamento del primario senza spazio sotto la barra di alimentazione.')
++ if top[1]<top_y:line(top,(top[0],top_y))
++ line((top[0],top_y),(x+125,top_y));line((x+125,top_y),(x+125,sy+142.5));m.add_circle((x+125,sy+142.5),1.2)
+  ref.add_attrib('MEASURED_FEEDER',r['measuredFeeder'],origin,dxfattribs={'flags':1,'height':1})
+- if not group.get('topAligned'):text('AUX L/N DA VERIF.',x+91,sy+243,1.4)
++ if not group.get('topAligned'):text('AUX L/N DA VERIF.',x+91,top_y-6,1.4)
+  protection=r.get('voltageProtection') or {}
+  for column,sigla,article,label in [(x+25,group['ctSigla'],' / '.join(r.get('relatedQuotationArticles',[])) or 'DA VERIF.','ROGOWSKI - DA CONFERMARE' if 'ORF' in str(r.get('articleProposal')) else 'TA - DA CONFERMARE'),(x+50,group['protectionSigla'],protection.get('articleProposal') or 'DA VERIF.','PROTEZIONE MISURA' if protection else 'PROTEZIONE PROPOSTA'),(x+100,group['sigla'],r.get('articleProposal') or 'DA VERIF.','STRUMENTO MISURA' if r['templateValidated'] else 'STRUMENTO - DA CONFERMARE')]:
+   text(sigla,column,sy+127.5,1.8);text(label,column,sy+118,1.3);text(article,column,sy+103,1.7)
+--- /dev/null
++++ b/Alpha/measurement_placement.py
+@@ -0,0 +1,163 @@
++"""Posizionamento scelto dall'operatore per i moduli di misura (multimetro + TA).
++
++Prima di disegnare una misura il sistema chiede:
++  1. dove va collocata (modo);
++  2. su quale interruttore (dispositivo);
++  3. quale strumento (articolo), solo per misure non rilevate dal PDF.
++
++Modi:
++  upstream_general    a monte del generale: TA sull'arrivo linea, prima del generale
++  downstream_general  a valle del generale: TA sull'uscita del generale
++  downstream_device   a valle di un'utenza: TA sull'uscita dell'interruttore scelto
++
++Il motore di disegno riceve solo `measuredFeeder`, `measuredFeederConfirmed` e
++`assignmentSource`; qui si ricavano da modo e dispositivo, con le verifiche.
++"""
++from __future__ import annotations
++
++import copy
++import uuid
++
++MODI = {
++    'upstream_general': 'A monte del generale',
++    'downstream_general': 'A valle del generale',
++    'downstream_device': 'A valle di un\'utenza',
++}
++MODI_DISEGNABILI = {'downstream_general', 'downstream_device'}
++STRUMENTI = {
++    'MFD41ORFCDT': 'Multifunzione con TA Rogowski',
++    'MFD4421': 'Multifunzione con TA',
++}
++
++
++def _nodi(progetto: dict) -> dict:
++    return {n['id']: n for n in progetto.get('nodes', [])}
++
++
++def _radici(progetto: dict) -> list[dict]:
++    return [n for n in progetto.get('nodes', []) if not n.get('parent')]
++
++
++def _descrizione(nodo: dict) -> dict:
++    valori = nodo.get('values', {})
++    return {
++        'id': nodo['id'],
++        'sigla': nodo.get('sigla'),
++        'articolo': valori.get('articolo') or (nodo.get('articles') or [None])[0],
++        'utenza': nodo.get('label'),
++        'padre': nodo.get('parent'),
++        'pagina': nodo.get('evidence', {}).get('page'),
++    }
++
++
++def modo_proposto(progetto: dict, dispositivo: str | None) -> str | None:
++    """Modo ricavato dal dispositivo rilevato: solo un suggerimento da confermare."""
++    nodi = _nodi(progetto)
++    nodo = nodi.get(dispositivo)
++    if nodo is None:
++        return None
++    radici = _radici(progetto)
++    if not nodo.get('parent') and len(radici) == 1:
++        return 'downstream_general'
++    return 'downstream_device'
++
++
++def opzioni(progetto: dict) -> dict:
++    """Domande da porre all'operatore, con candidati e proposte per le misure già rilevate."""
++    radici = _radici(progetto)
++    generali = radici if len(radici) == 1 else []
++    misure = []
++    for misura in progetto.get('measurementAssemblies', []):
++        proposta = misura.get('measuredFeeder')
++        misure.append({
++            'id': misura['id'],
++            'pagina': misura.get('page'),
++            'strumento': misura.get('articleProposal'),
++            'dispositivoProposto': proposta,
++            'modoProposto': modo_proposto(progetto, proposta),
++            'posizionamento': misura.get('placement'),
++            'confermata': bool(misura.get('measuredFeederConfirmed')),
++        })
++    return {
++        'modi': [
++            {'id': ident, 'etichetta': testo, 'disegnabile': ident in MODI_DISEGNABILI,
++             'motivo': None if ident in MODI_DISEGNABILI else 'Disegno sull\'arrivo linea ancora da integrare.'}
++            for ident, testo in MODI.items()
++        ],
++        'strumenti': [{'articolo': a, 'descrizione': d} for a, d in STRUMENTI.items()],
++        'generali': [_descrizione(n) for n in generali],
++        'dispositivi': [_descrizione(n) for n in progetto.get('nodes', [])],
++        'misure': misure,
++        'radici': len(radici),
++    }
++
++
++def _risolvi_dispositivo(progetto: dict, modo: str, dispositivo: str | None) -> str:
++    nodi = _nodi(progetto)
++    radici = _radici(progetto)
++    if modo == 'downstream_general':
++        if dispositivo is None:
++            if len(radici) != 1:
++                raise ValueError('Generale non univoco: indicare l\'interruttore generale.')
++            return radici[0]['id']
++        if dispositivo not in nodi:
++            raise ValueError('Interruttore non presente nel diagramma: ' + str(dispositivo))
++        if nodi[dispositivo].get('parent'):
++            raise ValueError('Il generale non può avere un\'alimentazione a monte: ' + str(nodi[dispositivo].get('sigla')))
++        return dispositivo
++    if modo == 'downstream_device':
++        if dispositivo not in nodi:
++            raise ValueError('Indicare l\'interruttore dell\'utenza misurata.')
++        return dispositivo
++    if modo == 'upstream_general':
++        raise ValueError('Misura a monte del generale: disegno sull\'arrivo linea ancora da integrare.')
++    raise ValueError('Posizione della misura sconosciuta: ' + str(modo))
++
++
++def posiziona(progetto: dict, posizioni: list[dict]) -> dict:
++    """Applica le scelte dell'operatore e restituisce una copia del progetto.
++
++    Ogni voce: {misura?, modo, dispositivo?, strumento?, rapporto?, quantita?}.
++    Senza `misura` si aggiunge un nuovo modulo (serve `strumento`).
++    """
++    risultato = copy.deepcopy(progetto)
++    misure = risultato.setdefault('measurementAssemblies', [])
++    per_id = {m['id']: m for m in misure}
++    for voce in posizioni:
++        modo = voce.get('modo')
++        feeder = _risolvi_dispositivo(risultato, modo, voce.get('dispositivo'))
++        misura = per_id.get(voce.get('misura'))
++        if voce.get('misura') and misura is None:
++            raise ValueError('Misura sconosciuta: ' + str(voce['misura']))
++        if misura is None:
++            strumento = voce.get('strumento')
++            if strumento not in STRUMENTI:
++                raise ValueError('Indicare lo strumento da inserire: ' + ', '.join(STRUMENTI))
++            misura = {
++                'id': uuid.uuid4().hex[:12], 'page': None, 'status': 'operator_placed', 'confirmed': True,
++                'meterBox': None, 'ctGeometry': None, 'articleProposal': strumento, 'articleBox': None,
++                'articleAssociation': 'operator', 'relatedQuotationArticles': [],
++                'auxiliaryFeeds': {'L': None, 'N': None}, 'ratio': None, 'quantity': None,
++                'voltageProtection': None, 'requiresIntegration': True,
++                'limitations': ['Misura inserita dall\'operatore: protezione voltmetrica, rapporto TA e ausiliari da completare.'],
++            }
++            misure.append(misura)
++            per_id[misura['id']] = misura
++        elif voce.get('strumento'):
++            if voce['strumento'] not in STRUMENTI:
++                raise ValueError('Strumento sconosciuto: ' + str(voce['strumento']))
++            misura['articleProposal'] = voce['strumento']
++        misura['measuredFeeder'] = feeder
++        misura['measuredFeederConfirmed'] = True
++        misura['assignmentSource'] = 'operator'
++        misura['placement'] = {'mode': modo, 'deviceId': feeder}
++        for campo, chiave in (('rapporto', 'ratio'), ('quantita', 'quantity')):
++            if voce.get(campo) is not None:
++                misura[chiave] = voce[campo]
++    occupati: dict[str, str] = {}
++    for misura in misure:
++        feeder = misura.get('measuredFeeder')
++        if feeder in occupati:
++            raise ValueError('Due misure sullo stesso interruttore: composizione ancora da definire.')
++        occupati[feeder] = misura['id']
++    return risultato
+--- a/Alpha/pdf_annotazioni.py
++++ b/Alpha/pdf_annotazioni.py
+@@ -85,3 +85,26 @@
+ 
+ def codici(sorgente) -> collections.Counter:
+     return collections.Counter(c for articolo in estrai_articoli(sorgente) for c in articolo['codici'])
++
++
++_TOKEN_TESTO = re.compile(r'[A-Z0-9][A-Z0-9/\-]*[A-Z0-9]')
++
++
++def _e_articolo_testo(token: str) -> bool:
++    if not listino.esiste(token):
++        return False
++    return bool(re.fullmatch(r'\d{6}', token) or (re.search(r'[A-Z]', token) and re.search(r'\d', token)))
++
++
++def codici_da_testo_pagine(sorgente) -> collections.Counter:
++    """Codici in listino scritti come testo normale della pagina (PDF senza annotazioni FreeText)."""
++    pagine, da_chiudere = _pagine(sorgente)
++    conteggio: collections.Counter = collections.Counter()
++    try:
++        for pagina in pagine:
++            testo = pagina.get_text().upper()
++            conteggio.update(t for t in _TOKEN_TESTO.findall(testo) if _e_articolo_testo(t))
++    finally:
++        if da_chiudere is not None:
++            da_chiudere.close()
++    return conteggio
+--- a/strumenti/report_golden.py
++++ b/strumenti/report_golden.py
+@@ -61,9 +61,11 @@
+ def metrica(nome: str, matricola: str | None) -> dict:
+     percorso = trova_input(nome)
+     riga = {'matricola': matricola, 'input': nome, 'trovato': percorso is not None}
+-    codici_input = set(pdf_annotazioni.codici(percorso)) if percorso else set()
++    codici_annot = set(pdf_annotazioni.codici(percorso)) if percorso else set()
++    codici_testo = set(pdf_annotazioni.codici_da_testo_pagine(percorso)) if percorso else set()
++    codici_input = codici_annot | codici_testo
+     non_in_listino = sorted(c for c in codici_input if not listino.esiste(c))
+-    riga.update(codici_input=len(codici_input), non_in_listino=non_in_listino)
++    riga.update(codici_input=len(codici_input), codici_solo_testo=len(codici_testo - codici_annot), non_in_listino=non_in_listino)
+     asbuilt = pdf_asbuilt(matricola) if matricola else []
+     if asbuilt:
+         codici_ab = codici_asbuilt(asbuilt)
+--- /dev/null
++++ b/tests/test_packing_misura.py
+@@ -0,0 +1,24 @@
++"""Un modulo largo (misura) con derivazioni: la corsia di ritorno sta dopo il modulo."""
++import packing
++
++
++def _nodi():
++    return [
++        {'id': 'a', 'parent': None, 'drawingWidth': 6, 'values': {}},
++        {'id': 'b', 'parent': 'a', 'values': {}},
++    ]
++
++
++def test_corsia_dopo_modulo_largo():
++    pagine, posizioni, _ = packing.plan_pages(_nodi())
++    assert posizioni['a']['span'] == 6
++    corsia = pagine[0]['lanes']['a']
++    assert corsia == posizioni['a']['x'] + 25 * 6
++    assert posizioni['b']['x'] > corsia
++
++
++def test_corsia_modulo_stretto_invariata():
++    nodi = _nodi()
++    del nodi[0]['drawingWidth']
++    pagine, posizioni, _ = packing.plan_pages(nodi)
++    assert pagine[0]['lanes']['a'] == posizioni['a']['x'] + 25
+--- /dev/null
++++ b/tests/test_measurement_placement.py
+@@ -0,0 +1,61 @@
++import pytest
++
++import measurement_placement as mp
++
++
++def _progetto():
++    return {
++        'nodes': [
++            {'id': 'g', 'sigla': 'QS1', 'parent': None, 'values': {'articolo': 'T714WF/630B'}},
++            {'id': 'a', 'sigla': 'QF2', 'parent': 'g', 'values': {}},
++            {'id': 'b', 'sigla': 'QF3', 'parent': 'g', 'values': {}},
++        ],
++        'measurementAssemblies': [{'id': 'm1', 'articleProposal': 'MFD41ORFCDT', 'measuredFeeder': 'g'}],
++    }
++
++
++def test_opzioni_propone_modo_dal_dispositivo():
++    o = mp.opzioni(_progetto())
++    assert [m['id'] for m in o['modi']] == ['upstream_general', 'downstream_general', 'downstream_device']
++    assert not o['modi'][0]['disegnabile']
++    assert o['misure'][0]['modoProposto'] == 'downstream_general'
++    assert len(o['dispositivi']) == 3
++
++
++def test_valle_generale_senza_dispositivo_usa_unico_generale():
++    r = mp.posiziona(_progetto(), [{'misura': 'm1', 'modo': 'downstream_general'}])
++    m = r['measurementAssemblies'][0]
++    assert m['measuredFeeder'] == 'g' and m['assignmentSource'] == 'operator'
++    assert m['placement'] == {'mode': 'downstream_general', 'deviceId': 'g'}
++
++
++def test_valle_utenza_aggiunge_misura_operatore():
++    r = mp.posiziona(_progetto(), [{'modo': 'downstream_device', 'dispositivo': 'a', 'strumento': 'MFD4421', 'rapporto': '100/5'}])
++    nuova = r['measurementAssemblies'][-1]
++    assert nuova['measuredFeeder'] == 'a' and nuova['ratio'] == '100/5' and nuova['status'] == 'operator_placed'
++
++
++def test_progetto_originale_non_modificato():
++    p = _progetto()
++    mp.posiziona(p, [{'modo': 'downstream_device', 'dispositivo': 'a', 'strumento': 'MFD4421'}])
++    assert len(p['measurementAssemblies']) == 1
++
++
++@pytest.mark.parametrize('voce', [
++    {'modo': 'upstream_general'},
++    {'modo': 'downstream_general', 'dispositivo': 'a'},
++    {'modo': 'downstream_device'},
++    {'modo': 'downstream_device', 'dispositivo': 'zz', 'strumento': 'MFD4421'},
++    {'modo': 'downstream_device', 'dispositivo': 'a'},
++    {'modo': 'downstream_device', 'dispositivo': 'g', 'strumento': 'MFD4421'},
++])
++def test_scelte_non_valide(voce):
++    with pytest.raises(ValueError):
++        mp.posiziona(_progetto(), [voce])
++
++
++def test_generale_non_univoco_richiede_scelta():
++    p = _progetto()
++    p['nodes'].append({'id': 'h', 'sigla': 'QS9', 'parent': None, 'values': {}})
++    with pytest.raises(ValueError):
++        mp.posiziona(p, [{'modo': 'downstream_general', 'strumento': 'MFD4421'}])
+--- a/Alpha/frontend/src/hierarchy.ts
++++ b/Alpha/frontend/src/hierarchy.ts
+@@ -79,7 +79,8 @@
+  * Compact vertical forest. Invalid chains remain visible with a diagnostic,
+  * retaining their actual parent fields (no invented external supplies).
+  */
+-export function layoutHierarchy<T extends DiagramNode>(nodes: readonly T[], availableWidth = 420): LayoutNode<T>[] {
++/** `extraBelow`: spazio verticale riservato sotto un blocco (es. multimetro con TA). */
++export function layoutHierarchy<T extends DiagramNode>(nodes: readonly T[], availableWidth = 420, extraBelow: ReadonlyMap<string, number> = new Map()): LayoutNode<T>[] {
+     const map = nodeMap(nodes);
+     const cycles = new Set<string>();
+     for (const node of nodes) {
+@@ -132,7 +133,7 @@
+             const expandedWidth = Math.min(520, Math.max(childWidth, (usableWidth - (columns - 1) * 28) / columns));
+             for (const child of kids) sizes.get(child)!.width = expandedWidth;
+         }
+-        const treeHeight = height + (columns > 1 ? Math.ceil(kids.length / columns) * (126 + 28) : kids.reduce((sum, child) => sum + 18 + sizes.get(child)!.treeHeight, 0));
++        const treeHeight = height + (extraBelow.get(id) || 0) + (columns > 1 ? Math.ceil(kids.length / columns) * (126 + 28) : kids.reduce((sum, child) => sum + 18 + sizes.get(child)!.treeHeight, 0));
+         sizes.set(id, { width, height, span, treeHeight, depth, columns });
+         return span;
+     };
+@@ -152,7 +153,7 @@
+             output.layoutIssue = 'missing_parent';
+         placed.set(id, output);
+         const kids = children.get(id) || [];
+-        let childTop = top + size.height + 18;
++        let childTop = top + size.height + 18 + (extraBelow.get(id) || 0);
+         for (const [index, child] of kids.entries()) {
+             const column = index % size.columns;
+             place(child, left + 40 + column * (sizes.get(child)!.width + 28), childTop);
+@@ -196,5 +197,5 @@
+     }
+     return result;
+ }
+-
+-
++
++
+--- a/Alpha/frontend/src/types.ts
++++ b/Alpha/frontend/src/types.ts
+@@ -27,6 +27,20 @@
+     evidence?: Record<string, any>;
+     warnings?: string[];
+     request?: Record<string, any>;
++    [key: string]: any;
++}
++export interface MeasurementAssembly {
++    id: string;
++    page?: number | null;
++    status?: string;
++    articleProposal?: string | null;
++    measuredFeeder?: string | null;
++    measuredFeederConfirmed?: boolean;
++    assignmentSource?: string;
++    placement?: { mode: string; deviceId: string };
++    ratio?: string | null;
++    quantity?: number | null;
++    relatedQuotationArticles?: string[];
+     [key: string]: any;
+ }
+ export interface Settings {
+--- a/Alpha/frontend/src/Diagram.tsx
++++ b/Alpha/frontend/src/Diagram.tsx
+@@ -3,7 +3,8 @@
+ import { Button } from 'antd';
+ import { orthogonalBranches, layoutHierarchy } from './hierarchy';
+ import type { LayoutNode } from './hierarchy';
+-import type { Device } from './types';
++import type { Device, MeasurementAssembly } from './types';
++const METER_BAND = 52;
+ type Props = {
+     nodes: LayoutNode<Device>[];
+     selected: string | null;
+@@ -12,8 +13,12 @@
+     onConnect: (child: string, parent: string) => void;
+     onImport: () => void;
+     disabled: boolean;
++    measurements?: MeasurementAssembly[];
++    selectedMeasurement?: string | null;
++    onSelectMeasurement?: (id: string) => void;
++    onMoveMeasurement?: (id: string, deviceId: string) => void;
+ };
+-export function Diagram({ nodes, selected, onSelect, onMove, onConnect, onImport, disabled }: Props) {
++export function Diagram({ nodes, selected, onSelect, onMove, onConnect, onImport, disabled, measurements = [], selectedMeasurement = null, onSelectMeasurement, onMoveMeasurement }: Props) {
+     const viewport = useRef<HTMLDivElement>(null), world = useRef<HTMLDivElement>(null);
+     const [viewportWidth, setViewportWidth] = useState(800);
+     useEffect(() => {
+@@ -61,8 +66,13 @@
+             }
+     } return ids; };
+     const moved = drag ? descendants(drag.id) : new Set<string>();
++    const ids = useMemo(() => new Set(nodes.map(n => n.id)), [nodes]);
++    const placedMeasurements = useMemo(() => measurements.filter(m => m.measuredFeeder && ids.has(m.measuredFeeder)), [measurements, ids]);
++    const extraBelow = useMemo(() => new Map(placedMeasurements.map(m => [m.measuredFeeder as string, METER_BAND])), [placedMeasurements]);
++    const [meterDrag, setMeterDrag] = useState<{ id: string; px: number; py: number; dx: number; dy: number } | null>(null);
++    // Le coordinate salvate sono relative alla disposizione senza misure: lo spazio riservato resta fuori dalla linea di base.
+     const baseline = useMemo(() => new Map(layoutHierarchy(nodes).map(n => [n.id, n])), [nodes]);
+-    const responsive = useMemo(() => layoutHierarchy(nodes, viewportWidth / zoom), [nodes, viewportWidth, zoom]);
++    const responsive = useMemo(() => layoutHierarchy(nodes, viewportWidth / zoom, extraBelow), [nodes, viewportWidth, zoom, extraBelow]);
+     const drawn = responsive.map(n => {
+         const saved = nodes.find(item => item.id === n.id)!;
+         const base = baseline.get(n.id)!;
+@@ -74,6 +84,16 @@
+         return; const v = viewport.current; setZoom(1); const anchor = drawn.find(n => n.id === selected) || drawn[0]; v.scrollLeft = anchor ? Math.max(0, anchor.x + anchor.width / 2 - v.clientWidth / 2) : 0; v.scrollTop = anchor ? Math.max(0, anchor.y - 20) : 0; }
+     useEffect(() => { fit(); }, [nodes.length]);
+     function targetAt(e: PointerEvent) { return document.elementsFromPoint(e.clientX, e.clientY).map(el => el.closest<HTMLElement>('[data-device]')).find(el => el && !moved.has(el.dataset.device!))?.dataset.device || null; }
++    function releaseMeter(e: PointerEvent) {
++        if (!meterDrag) return;
++        const dx = (e.clientX - meterDrag.px) / zoom, dy = (e.clientY - meterDrag.py) / zoom;
++        const moved = Math.abs(dx) + Math.abs(dy) > 3;
++        const candidate = moved ? targetAt(e) : null;
++        const id = meterDrag.id;
++        setMeterDrag(null); setHover(null);
++        if (candidate) onMoveMeasurement?.(id, candidate);
++        else if (!moved) onSelectMeasurement?.(id);
++    }
+     function release(e: PointerEvent) { if (!drag)
+         return; const dx = (e.clientX - drag.px) / zoom, dy = (e.clientY - drag.py) / zoom; const didMove = Math.abs(dx) + Math.abs(dy) > 3; const candidate = didMove ? targetAt(e) : null; setDrag(null); setHover(null); if (candidate)
+         onConnect(drag.id, candidate);
+@@ -97,10 +117,24 @@
+                 setLink(n.id); }} onPointerDown={e => { e.stopPropagation(); if (disabled || e.button !== 0)
+                 return; portDrag.current = { id: n.id, pointerId: e.pointerId }; setLink(n.id); }}/>
+  </div>)}
++ {placedMeasurements.map(m => {
++            const device = drawn.find(n => n.id === m.measuredFeeder)!;
++            const dragged = meterDrag && meterDrag.id === m.id;
++            const label = `MU · ${m.articleProposal || 'strumento'}`;
++            const detail = [m.ratio ? `TA ${m.ratio}` : 'TA da definire', m.quantity ? `×${m.quantity}` : ''].filter(Boolean).join(' ');
++            const left = device.x + 16, top = device.y + device.height + 8;
++            return <div key={m.id}><div className="meter-link" style={{ left: left + 18, top: device.y + device.height, height: 8 }}/>
++ <div data-measurement={m.id} className={'meter' + (selectedMeasurement === m.id ? ' selected' : '') + (dragged ? ' drop-source' : '')} style={{ left, top, width: Math.max(220, device.width - 32), height: METER_BAND - 14, transform: dragged ? `translate(${meterDrag!.dx}px, ${meterDrag!.dy}px)` : undefined }}
++ onPointerDown={e => { if (disabled || e.button !== 0) return; e.preventDefault(); setMeterDrag({ id: m.id, px: e.clientX, py: e.clientY, dx: 0, dy: 0 }); e.currentTarget.setPointerCapture(e.pointerId); }}
++ onPointerMove={e => { if (!meterDrag || meterDrag.id !== m.id) return; setMeterDrag({ ...meterDrag, dx: (e.clientX - meterDrag.px) / zoom, dy: (e.clientY - meterDrag.py) / zoom }); setHover(targetAt(e)); }}
++ onPointerUp={releaseMeter} onPointerCancel={() => { setMeterDrag(null); setHover(null); }}>
++ <span className="ta-chip" title="Trascina il TA su un altro blocco per misurare quell’utenza"><i/><i/> TA</span>
++ <b>{label}</b><span className="meter-text">{detail}{m.measuredFeederConfirmed ? '' : ' · da confermare'}</span></div></div>;
++        })}
+  </div></div>}
+- </div><footer className="diagram-hint">Trascina un blocco sul padre per inserirlo a valle. Le linee rappresentano le alimentazioni del disegno.</footer></section>;
++ </div><footer className="diagram-hint">Trascina un blocco sul padre per inserirlo a valle. Trascina il TA di un multimetro su un altro blocco per spostare la misura. Le linee rappresentano le alimentazioni del disegno.</footer></section>;
+ }
+-
+-
+-
+-
++
++
++
++
+--- a/Alpha/frontend/src/App.tsx
++++ b/Alpha/frontend/src/App.tsx
+@@ -4,6 +4,7 @@
+ import { Alert, Button, Checkbox, Collapse, ConfigProvider, Drawer, Dropdown, Empty, Input, InputNumber, Modal, Progress, Select, Space } from 'antd';
+ import { api, encodeFile, importPdf } from './api';
+ import { Diagram } from './Diagram';
++import { MeasurementPanel } from './MeasurementPanel';
+ import { editProjectDevice } from './editDevice';
+ import { Inspector, TextEdit } from './Inspector';
+ import { Scan } from './Scan';
+@@ -91,6 +92,7 @@
+     const learning = useMemory();
+  const [cableReviewOpen,setCableReviewOpen]=useState(false);
+  const [drawingData,setDrawingData]=useState<'draft'|'export'|'edit'|null>(null);
++ const [measurePanel,setMeasurePanel]=useState<{id:string|null;deviceId?:string|null}|null>(null);
+     const [request, setRequest] = useState({ kind: 'MTD', poles: '4P', current: 25, voltage: 400, curve: 'C', diff_mA: 30, diff_type: 'A', label: 'Nuova utenza' });
+     useEffect(() => {
+         let active = true;
+@@ -137,6 +139,16 @@
+         setNotice('Modifica non applicata: impossibile registrare la correzione. ' + String(e));
+         return false;
+     } }
++    async function moveMeasurement(id: string, deviceId: string) {
++        const roots = project.nodes.filter(n => !n.parent);
++        const mode = roots.length === 1 && roots[0].id === deviceId ? 'downstream_general' : 'downstream_device';
++        try {
++            const result = await api<{ project: Project }>('/api/measurement/place', { project, placements: [{ misura: id, modo: mode, dispositivo: deviceId }] });
++            commit(result.project, 'measurement_move');
++        } catch (e) {
++            setNotice('Misura non spostata: ' + (e instanceof Error ? e.message : String(e)));
++        }
++    }
+     function undo() { const previous = history.at(-1); if (!previous)
+         return; try {
+         learning.enqueue(corrections(current.current, previous, 'undo_operator'));
+@@ -323,10 +335,10 @@
+  <header className="studio-header"><div className="brand">BTicino Studio <span>ALPHA 0.3</span></div><nav><Button onClick={() => file.current?.click()} disabled={!!busy || !ready}>Importa PDF</Button><Button disabled={!project.nodes.length || !!busy} onClick={() => setDrawingData('draft')}>Bozza PDF</Button><Button type="primary" disabled={!project.nodes.length || !!busy} onClick={() => setDrawingData('export')}>Genera DWG</Button><Dropdown menu={{ onClick: ({ key }) => void more(key), items: [{ key: 'save', label: 'Salva progetto' }, { key: 'open', label: 'Apri progetto salvato' }, { type: 'divider' }, { key: 'drawingData', label: 'Dati del quadro e cartigli' }, { key: 'settings', label: 'Impostazioni quadro e MHQ' }, { key: 'memory', label: 'Memoria di apprendimento' }, { key: 'legacy', label: 'Editor precedente · verifiche specialistiche' }] }} trigger={['click']} disabled={!!busy}><Button>Altro</Button></Dropdown></nav></header>
+  <input type="file" ref={file} accept=".pdf" hidden onChange={e => { const f = e.target.files?.[0]; e.target.value = ''; if (f)
+         void loadPdf(f); }}/>
+- <div className="project-bar"><div><span className="eyebrow">SCHEMA / ALIMENTAZIONI</span><h2>{project.name}</h2><span className="muted">{pending} schede da verificare{ambiguities ? ` · ${ambiguities} letture ambigue` : ''}{learning.pending ? ` · ${learning.pending} correzioni da sincronizzare` : ''}</span></div><Space wrap>{ambiguities > 0 && <Button type="primary" onClick={() => setDrawer('guided')}>Rivedi {ambiguities} letture</Button>}<Button onClick={() => setDrawer('scan')}>Documento</Button><Button onClick={() => setDrawer('add')} disabled={!!busy}>+ Apparecchio</Button><Dropdown trigger={['click']} menu={{ items: [{ key: 'arrange', label: 'Riordina gerarchia' }, { key: 'undo', label: 'Annulla modifica', disabled: !history.length }, { key: 'review', label: 'Controlli del progetto' }], onClick: ({ key }) => key === 'undo' ? undo() : void more(key) }} disabled={!!busy}><Button>Modifica</Button></Dropdown><Button danger onClick={() => setClearOpen(true)} disabled={!!busy}>Svuota</Button></Space></div>
++ <div className="project-bar"><div><span className="eyebrow">SCHEMA / ALIMENTAZIONI</span><h2>{project.name}</h2><span className="muted">{pending} schede da verificare{ambiguities ? ` · ${ambiguities} letture ambigue` : ''}{learning.pending ? ` · ${learning.pending} correzioni da sincronizzare` : ''}</span></div><Space wrap>{ambiguities > 0 && <Button type="primary" onClick={() => setDrawer('guided')}>Rivedi {ambiguities} letture</Button>}<Button onClick={() => setDrawer('scan')}>Documento</Button><Button onClick={() => setDrawer('add')} disabled={!!busy}>+ Apparecchio</Button><Button onClick={() => setMeasurePanel({id:null})} disabled={!!busy||!project.nodes.length}>+ Multimetro e TA</Button><Dropdown trigger={['click']} menu={{ items: [{ key: 'arrange', label: 'Riordina gerarchia' }, { key: 'undo', label: 'Annulla modifica', disabled: !history.length }, { key: 'review', label: 'Controlli del progetto' }], onClick: ({ key }) => key === 'undo' ? undo() : void more(key) }} disabled={!!busy}><Button>Modifica</Button></Dropdown><Button danger onClick={() => setClearOpen(true)} disabled={!!busy}>Svuota</Button></Space></div>
+  {notice && <Alert className="notice" title={notice} closable onClose={() => setNotice('')} type="info"/>}{learning.error && <Alert title={`Memoria non sincronizzata: ${learning.error}. Le correzioni restano nella coda locale.`} type="warning" action={<Button onClick={() => void learning.retry()}>Riprova</Button>}/>}
+  {reviewProject && !reviewOpen && <Alert title='Revisione PDF in attesa' action={<Button onClick={() => setReviewOpen(true)}>Riprendi revisione</Button>}/>}
+- {drawingData && <DrawingData project={project} onClose={()=>setDrawingData(null)} onApply={next=>{if(commit(next,'drawing_metadata')){const mode=drawingData;setDrawingData(null);if(mode!=='edit')void exportDrawing(mode==='draft',next);}}}/>}{drawer === 'guided' && <ReviewWizard project={project} onClose={() => setDrawer(null)} onChange={p => { commit(p, 'guided_review'); }} onDraft={() => { setDrawer(null); setDrawingData('draft'); }}/>}<Diagram nodes={project.nodes as LayoutNode<Device>[]} selected={selected} onSelect={setSelected} onMove={move} onConnect={askConnection} onImport={() => file.current?.click()} disabled={!!busy || !ready}/>
++ {drawingData && <DrawingData project={project} onClose={()=>setDrawingData(null)} onApply={next=>{if(commit(next,'drawing_metadata')){const mode=drawingData;setDrawingData(null);if(mode!=='edit')void exportDrawing(mode==='draft',next);}}}/>}{drawer === 'guided' && <ReviewWizard project={project} onClose={() => setDrawer(null)} onChange={p => { commit(p, 'guided_review'); }} onDraft={() => { setDrawer(null); setDrawingData('draft'); }}/>}<Diagram nodes={project.nodes as LayoutNode<Device>[]} selected={selected} onSelect={setSelected} onMove={move} onConnect={askConnection} onImport={() => file.current?.click()} disabled={!!busy || !ready} measurements={project.measurementAssemblies||[]} selectedMeasurement={measurePanel?.id??null} onSelectMeasurement={id=>setMeasurePanel({id})} onMoveMeasurement={(id,deviceId)=>void moveMeasurement(id,deviceId)}/>{measurePanel&&<MeasurementPanel key={(measurePanel.id||'nuova')+(measurePanel.deviceId||'')} project={project} measurementId={measurePanel.id} deviceId={measurePanel.deviceId} onClose={()=>setMeasurePanel(null)} onApply={next=>{if(commit(next,'measurement_placement'))setMeasurePanel(null);}}/>}
+  <Modal className="device-modal" title={node ? `${node.sigla} · ${node.label}` : 'Apparecchio'} open={!!node && !drawer} onCancel={() => setSelected(null)} centered width={860} footer={<Button type="primary" onClick={() => setSelected(null)}>Chiudi caratteristiche</Button>}>{node && <Inspector key={node.id} expanded node={node} project={project} edit={edit} connect={parent => askConnection(node.id, parent)} remove={() => setRemoveId(node.id)}/>}</Modal>
+  <Drawer title={{ scan: 'Documento e lettura visiva', settings: 'Impostazioni quadro', add: 'Aggiungi apparecchio', memory: 'Memoria di apprendimento', review: 'Controlli del progetto' }[drawer || ''] || ''} open={!!drawer && drawer !== 'guided'} onClose={() => setDrawer(null)} size={drawer === 'scan' ? 'large' : 'default'}>
+  {drawer === 'scan' && <Scan project={project} onSelect={id => { setSelected(id); setDrawer(null); }}/>}
+--- a/Alpha/frontend/src/style.css
++++ b/Alpha/frontend/src/style.css
+@@ -1,13 +1,25 @@
+ :root{font-family:'Arial Narrow','Segoe UI',sans-serif;color:#111;background:#f5f4ef;font-synthesis:none}*{box-sizing:border-box}body{margin:0}button,input,select{font:inherit}a{color:#111;text-underline-offset:3px}.studio{height:100dvh;display:flex;flex-direction:column}.studio-header{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:14px 24px;border-bottom:2px solid #111;background:#f5f4ef}.brand{font:25px Georgia,serif;white-space:nowrap}.brand span{font:9px Consolas,monospace;letter-spacing:.08em;vertical-align:middle;background:#111;color:#f5f4ef;padding:5px 7px;margin-left:8px}.studio-header nav{display:flex;gap:8px;align-items:center}.studio .ant-btn{font-size:12px;text-transform:uppercase;letter-spacing:.05em;font-weight:700}.project-bar{display:flex;justify-content:space-between;gap:20px;align-items:center;padding:18px 24px;border-bottom:1px solid #cecdc7}.eyebrow{font:10px Consolas,monospace;letter-spacing:.12em;color:#777}.project-bar h2{margin:5px 0;font-size:22px;letter-spacing:-.4px}.muted{font-size:12px;color:#777;line-height:1.5}.diagram{min-height:0;flex:1;display:flex;flex-direction:column}.diagram-tools{display:flex;align-items:center;justify-content:space-between;padding:10px 24px;border-bottom:1px solid #ddd;font:11px Consolas,monospace}.diagram-tools>div{display:flex;align-items:center;gap:9px}.viewport{flex:1;overflow:auto;position:relative;background-image:radial-gradient(#c8c7c1 .7px,transparent .7px);background-size:20px 20px;overscroll-behavior:contain}.diagram-world{position:relative;transform-origin:top left}.connections{position:absolute;inset:0;pointer-events:none}.connections path{fill:none;stroke:#888780;stroke-width:1.6}.connections path.active{stroke:#111;stroke-width:3}.device{position:absolute;display:flex;flex-direction:column;background:#fbfaf6;border:1px solid #777;cursor:grab;padding:12px;touch-action:none;user-select:none}.device-head{display:flex;justify-content:space-between;font:10px Consolas,monospace;gap:5px;color:#666}.device-label{font-weight:700;line-height:1.25;margin-top:10px;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden}.device small{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:9px Consolas,monospace;color:#777;margin-top:auto;padding-top:4px}.device.selected{border:2px solid #111;padding:11px;box-shadow:3px 3px #111}.device.drop-target{outline:3px solid #46795c;outline-offset:5px}.device.drop-target:after{content:'INSÉRISCI A VALLE';position:absolute;bottom:-32px;left:0;white-space:nowrap;background:#111;color:white;padding:6px;font:10px Consolas,monospace}.device.invalid{border-color:#ad4630}.socket{position:absolute;left:calc(50% - 6px);width:12px;height:12px;border:2px solid #f5f4ef;background:#111;border-radius:50%;padding:0;cursor:crosshair;z-index:1}.socket.in{top:-7px}.socket.out{bottom:-7px}.socket.armed{outline:4px solid #e7bc63}.socket:hover{outline:3px solid #bbb}.diagram-hint{padding:10px 20px;font-size:11px;color:#777;border-top:1px solid #cecdc7}.empty-diagram{width:min(480px,85%);margin:10vh auto;text-align:left;padding:30px;background:#f5f4ef}.empty-diagram h1{font:38px Georgia,serif;font-weight:400;margin:14px 0}.empty-diagram p{font-size:15px;line-height:1.6;color:#666}.empty-diagram button{margin-top:12px}.field{display:flex;flex-direction:column;gap:7px;margin:0 0 16px;font:11px Consolas,monospace;color:#666}.field .ant-select,.field .ant-input-number{width:100%}.field input{font:13px Consolas,monospace}.review-checks{display:flex;flex-direction:column;gap:9px;margin:22px 0}.field-proof{padding:12px 0;border-bottom:1px solid #ddd}.field-proof img{max-width:100%;display:block}.field-proof button{margin:3px}.inspector-form .ant-alert{margin:10px 0}.ant-drawer-header,.ant-modal-header{border-bottom:1px solid #111!important}.ant-drawer-title,.ant-modal-title{font-family:Georgia,serif!important;font-weight:400!important}.scan-controls{display:flex;align-items:center;gap:12px;flex-wrap:wrap}.scan-sheet{position:relative;width:100%;background:white;border:1px solid #aaa}.scan-sheet img,.scan-sheet svg{position:absolute;inset:0;width:100%;height:100%}.scan-sheet svg text{paint-order:stroke;stroke:white;stroke-width:.6;fill:#111}.notice{flex-shrink:0}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:11px}.ant-collapse-content{background:transparent!important}.ant-modal-body>p{line-height:1.6}
+ @media(max-width:800px){.studio-header{padding:12px;gap:10px;flex-wrap:wrap}.studio-header nav{gap:5px}.brand{font-size:21px}.brand span{font-size:8px}.project-bar{padding:12px;gap:10px;flex-wrap:wrap}.project-bar h2{font-size:18px}.diagram-tools{padding:8px 12px}.diagram-hint{display:none}.studio .ant-btn{font-size:10px;padding-inline:9px}.empty-diagram h1{font-size:30px}}
+-.pdf-review-modal .ant-modal-body{height:calc(100dvh - 190px);display:flex;flex-direction:column;min-height:350px}.pdf-review-grid{display:grid;grid-template-columns:minmax(0,1fr) 330px;gap:20px;min-height:0;flex:1}.review-document,.review-editor{overflow:auto;min-height:0}.review-editor{border-left:1px solid #ccc;padding-left:20px}.reading-progress{padding:4px 0 12px}.scan-wait{padding:60px 24px;text-align:center;color:#777}.pdf-review-modal .ant-modal-footer{display:flex;gap:10px;align-items:center;justify-content:flex-end}.pdf-review-modal .ant-modal-footer .muted{margin-right:auto}@media(max-width:800px){.pdf-review-grid{grid-template-columns:1fr;overflow:auto}.review-editor{border-left:0;border-top:1px solid #ccc;padding:16px 0;overflow:visible}.review-document{min-height:300px;overflow:visible}.pdf-review-modal .ant-modal-footer{flex-wrap:wrap}.pdf-review-modal .ant-modal-body{height:calc(100dvh - 230px)}}
+-.device-plate{display:block;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;opacity:.8}
++.pdf-review-modal .ant-modal-body{height:calc(100dvh - 190px);display:flex;flex-direction:column;min-height:350px}.pdf-review-grid{display:grid;grid-template-columns:minmax(0,1fr) 330px;gap:20px;min-height:0;flex:1}.review-document,.review-editor{overflow:auto;min-height:0}.review-editor{border-left:1px solid #ccc;padding-left:20px}.reading-progress{padding:4px 0 12px}.scan-wait{padding:60px 24px;text-align:center;color:#777}.pdf-review-modal .ant-modal-footer{display:flex;gap:10px;align-items:center;justify-content:flex-end}.pdf-review-modal .ant-modal-footer .muted{margin-right:auto}@media(max-width:800px){.pdf-review-grid{grid-template-columns:1fr;overflow:auto}.review-editor{border-left:0;border-top:1px solid #ccc;padding:16px 0;overflow:visible}.review-document{min-height:300px;overflow:visible}.pdf-review-modal .ant-modal-footer{flex-wrap:wrap}.pdf-review-modal .ant-modal-body{height:calc(100dvh - 230px)}}
++.device-plate{display:block;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;opacity:.8}
+ /* Compact vertical diagram: readable cards without zoom-to-fit. */
+-.studio-header{padding:10px 18px;border-bottom:1px solid #d6dbd6;background:#fff}.brand{font:600 21px 'Segoe UI',sans-serif}.brand span{font-size:10px;border-radius:4px}.project-bar{padding:10px 18px;gap:12px}.project-bar h2{margin:2px 0;font-size:20px}.studio .ant-btn{text-transform:none;letter-spacing:0;font-size:13px;font-weight:500}.diagram-tools{padding:8px 18px;font:13px 'Segoe UI',sans-serif}.viewport{background:#f5f6f3;background-image:none}.device{border:1px solid #ccd4cd;border-radius:9px;background:#fff;padding:12px 15px;font-family:'Segoe UI',sans-serif}.device-head{font:12px 'Segoe UI',sans-serif;color:#58675b}.device-label{margin-top:7px;line-height:1.3;font-weight:600}.device small{font:12px 'Segoe UI',sans-serif;color:#526157}.device.selected{padding:11px 14px;border:2px solid #426a50;background:#edf5ef;box-shadow:none}.device-plate{opacity:1}.connections path{stroke:#9aa89d;stroke-width:1.5}.connections path.active{stroke:#426a50;stroke-width:2}.socket.in{left:-7px;top:calc(50% - 6px)}.socket.out{left:10px}.diagram-hint{padding:7px 18px;font-size:12px}.device.drop-target:after{border-radius:5px;font:12px 'Segoe UI',sans-serif}.studio-header nav,.project-bar{flex-wrap:wrap}
++.studio-header{padding:10px 18px;border-bottom:1px solid #d6dbd6;background:#fff}.brand{font:600 21px 'Segoe UI',sans-serif}.brand span{font-size:10px;border-radius:4px}.project-bar{padding:10px 18px;gap:12px}.project-bar h2{margin:2px 0;font-size:20px}.studio .ant-btn{text-transform:none;letter-spacing:0;font-size:13px;font-weight:500}.diagram-tools{padding:8px 18px;font:13px 'Segoe UI',sans-serif}.viewport{background:#f5f6f3;background-image:none}.device{border:1px solid #ccd4cd;border-radius:9px;background:#fff;padding:12px 15px;font-family:'Segoe UI',sans-serif}.device-head{font:12px 'Segoe UI',sans-serif;color:#58675b}.device-label{margin-top:7px;line-height:1.3;font-weight:600}.device small{font:12px 'Segoe UI',sans-serif;color:#526157}.device.selected{padding:11px 14px;border:2px solid #426a50;background:#edf5ef;box-shadow:none}.device-plate{opacity:1}.connections path{stroke:#9aa89d;stroke-width:1.5}.connections path.active{stroke:#426a50;stroke-width:2}.socket.in{left:-7px;top:calc(50% - 6px)}.socket.out{left:10px}.diagram-hint{padding:7px 18px;font-size:12px}.device.drop-target:after{border-radius:5px;font:12px 'Segoe UI',sans-serif}.studio-header nav,.project-bar{flex-wrap:wrap}
+ .scan-readings{margin-top:16px}.scan-readings>div{padding:10px 12px;border-bottom:1px solid #d9dfd9;background:#fff}.scan-readings small{display:block;color:#58675b;margin-top:4px}.review-step h3{margin-top:20px}.review-step .ant-space-compact{margin-top:16px}.project-bar .muted{font-size:13px}.studio-header{min-height:58px}.diagram-tools{background:#fff}.device-label{font-size:15px!important}.brand span{background:#e6eee8;color:#254331}.connections path.active{stroke-width:2}
+ /* Desktop workspace: use width for circuits, keep hierarchy readable. */
+ .diagram-summary{display:flex;align-items:center;gap:16px;color:#294936}.diagram-summary>span{color:#69766d;font-size:12px}.diagram-tools{min-height:46px;gap:12px}.device{box-shadow:0 2px 4px #23482c08;border-color:#d2dbd3;border-radius:12px;padding:12px 16px}.device:hover{border-color:#73947d;box-shadow:0 3px 10px #23482c12}.device.supply-device{background:#eaf1eb;border-color:#8ba591}.device-head{font-size:12px;font-weight:600;color:#496453}.device-label{font-size:15px!important;letter-spacing:-.12px}.device small{color:#5b6a5f}.device.selected{padding:11px 15px;box-shadow:0 0 0 3px #44765612}.connections path{stroke:#a1b1a5;stroke-width:1.7}.studio-header{padding:10px 20px}.project-bar{background:#f6f6f1;padding:10px 20px}.project-bar h2{font-size:21px}.diagram-hint{background:#fff;color:#627366}.socket{background:#4b6e56;border-color:#f7faf7}.notice{font-size:13px}.studio .ant-btn{border-radius:6px;min-height:30px}.studio-header .ant-btn{min-height:35px;padding-inline:14px}
+ @media(max-width:800px){.diagram-summary{gap:5px;align-items:flex-start;flex-direction:column}.diagram-summary>span{font-size:11px}.studio-header{padding:10px 12px}.project-bar{padding:10px 12px}.diagram-tools{padding:8px 12px}.diagram-tools>div{gap:6px}.studio-header .ant-btn{padding-inline:10px}}
+ @media(max-width:520px){.diagram-summary>span{display:none}.brand{font-size:18px}.studio-header nav{width:100%}.studio-header nav>.ant-btn{flex:1}.diagram-tools{gap:6px}.diagram-tools>div{gap:4px}.project-bar .ant-space{flex-wrap:wrap}}
+-.device-modal .ant-modal-body{max-height:72vh;overflow:auto;padding-right:6px}.device-modal .inspector-form{display:grid;grid-template-columns:1fr 1fr;gap:12px 20px}.device-modal .inspector-form>.field{margin:0}.device-modal .inspector-form>.ant-collapse,.device-modal .review-checks,.device-modal .inspector-form>a,.device-modal .inspector-form>button{grid-column:1/-1}.device-modal .technical-fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.device-modal .technical-fields .field{margin:0}.device-modal .review-checks{margin:8px 0;flex-direction:row;flex-wrap:wrap}.device-modal .field{font:13px 'Segoe UI',sans-serif}.device-modal .ant-modal-title{font:600 18px 'Segoe UI',sans-serif!important}@media(max-width:600px){.device-modal .technical-fields{grid-template-columns:1fr 1fr}.device-modal .inspector-form{grid-template-columns:1fr}.device-modal .ant-modal-body{max-height:68vh}}
++.device-modal .ant-modal-body{max-height:72vh;overflow:auto;padding-right:6px}.device-modal .inspector-form{display:grid;grid-template-columns:1fr 1fr;gap:12px 20px}.device-modal .inspector-form>.field{margin:0}.device-modal .inspector-form>.ant-collapse,.device-modal .review-checks,.device-modal .inspector-form>a,.device-modal .inspector-form>button{grid-column:1/-1}.device-modal .technical-fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.device-modal .technical-fields .field{margin:0}.device-modal .review-checks{margin:8px 0;flex-direction:row;flex-wrap:wrap}.device-modal .field{font:13px 'Segoe UI',sans-serif}.device-modal .ant-modal-title{font:600 18px 'Segoe UI',sans-serif!important}@media(max-width:600px){.device-modal .technical-fields{grid-template-columns:1fr 1fr}.device-modal .inspector-form{grid-template-columns:1fr}.device-modal .ant-modal-body{max-height:68vh}}
+ .live-drawing{display:flex;flex-direction:column;gap:6px;margin-bottom:12px}.live-drawing canvas{width:100%;height:min(62vh,560px);border:1px solid #d6dbd6;border-radius:6px;background:#fff}.live-drawing small{color:#5b6a5f}
++
++.meter{position:absolute;display:flex;align-items:center;gap:8px;border:1px solid #7a8f80;border-radius:8px;background:#f3f7f3;padding:5px 10px;font:12px 'Segoe UI',sans-serif;cursor:grab;touch-action:none;user-select:none;z-index:2}
++.meter.selected{border:2px solid #426a50;padding:4px 9px}
++.meter.drop-source{opacity:.7;box-shadow:0 4px 14px #0003}
++.meter .ta-chip{display:inline-flex;align-items:center;gap:2px;flex:none;border-radius:11px;border:1px solid #426a50;background:#fff;padding:1px 8px;font-weight:700;color:#294936;cursor:grab}
++.meter .ta-chip i{display:inline-block;width:9px;height:9px;border:1.5px solid currentColor;border-radius:50%}
++.meter .ta-chip i+i{margin-left:-4px}
++.meter b{font-weight:600;white-space:nowrap}
++.meter span.meter-text{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#496453}
++.meter-link{position:absolute;width:2px;background:#426a50;z-index:1}
++.measurement-panel .measurement-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
++.measurement-panel .field{font:13px 'Segoe UI',sans-serif;margin:0 0 14px}
+--- /dev/null
++++ b/Alpha/frontend/src/MeasurementPanel.tsx
+@@ -0,0 +1,109 @@
++import { useEffect, useMemo, useState } from 'react';
++import { Alert, Button, InputNumber, Input, Modal, Radio, Select, Space } from 'antd';
++import { api } from './api';
++import type { MeasurementAssembly, Project } from './types';
++
++type Option = { id: string; etichetta: string; disegnabile: boolean; motivo?: string | null };
++type Options = { modi: Option[]; strumenti: { articolo: string; descrizione: string }[] };
++
++const FALLBACK: Options = {
++    modi: [
++        { id: 'upstream_general', etichetta: 'A monte del generale', disegnabile: false, motivo: 'Disegno sull’arrivo linea ancora da integrare.' },
++        { id: 'downstream_general', etichetta: 'A valle del generale', disegnabile: true },
++        { id: 'downstream_device', etichetta: 'A valle di un’utenza', disegnabile: true },
++    ],
++    strumenti: [
++        { articolo: 'MFD41ORFCDT', descrizione: 'Multifunzione con TA Rogowski' },
++        { articolo: 'MFD4421', descrizione: 'Multifunzione con TA' },
++    ],
++};
++
++type Props = {
++    project: Project;
++    /** null = nuova misura */
++    measurementId: string | null;
++    /** dispositivo preselezionato (es. dopo un trascinamento) */
++    deviceId?: string | null;
++    onClose: () => void;
++    onApply: (project: Project) => void;
++};
++
++export function MeasurementPanel({ project, measurementId, deviceId, onClose, onApply }: Props) {
++    const existing: MeasurementAssembly | undefined = (project.measurementAssemblies || []).find((m: MeasurementAssembly) => m.id === measurementId);
++    const roots = useMemo(() => project.nodes.filter(n => !n.parent), [project.nodes]);
++    const [options, setOptions] = useState<Options>(FALLBACK);
++    const initialDevice = deviceId || existing?.measuredFeeder || null;
++    const initialMode = existing?.placement?.mode
++        || (initialDevice ? (roots.length === 1 && roots[0].id === initialDevice ? 'downstream_general' : 'downstream_device') : 'downstream_general');
++    const [mode, setMode] = useState<string>(initialMode);
++    const [device, setDevice] = useState<string | null>(initialDevice || (roots.length === 1 ? roots[0].id : null));
++    const [instrument, setInstrument] = useState<string | null>(existing?.articleProposal || null);
++    const [ratio, setRatio] = useState<string>(existing?.ratio || '');
++    const [quantity, setQuantity] = useState<number | null>(existing?.quantity ?? null);
++    const [error, setError] = useState('');
++    const [busy, setBusy] = useState(false);
++
++    useEffect(() => {
++        let alive = true;
++        api<any>('/api/measurement/options', { project }).then(o => { if (alive && o.modi) setOptions({ modi: o.modi, strumenti: o.strumenti }); }).catch(() => undefined);
++        return () => { alive = false; };
++    }, []);
++
++    const candidates = mode === 'downstream_general' ? roots : project.nodes;
++    const describe = (n: Project['nodes'][number]) => `${n.sigla} · ${n.values?.articolo || (n.articles || [])[0] || n.kind} · ${n.label}`;
++
++    function pickMode(next: string) {
++        setMode(next);
++        if (next === 'downstream_general') setDevice(roots.length === 1 ? roots[0].id : null);
++    }
++
++    async function apply() {
++        setError('');
++        if (!device) { setError(mode === 'downstream_general' ? 'Scegli l’interruttore generale.' : 'Scegli l’interruttore dell’utenza misurata.'); return; }
++        if (!existing && !instrument) { setError('Scegli lo strumento da inserire.'); return; }
++        setBusy(true);
++        try {
++            const placement: Record<string, unknown> = { modo: mode, dispositivo: device };
++            if (existing) placement.misura = existing.id;
++            if (instrument) placement.strumento = instrument;
++            if (ratio.trim()) placement.rapporto = ratio.trim();
++            if (quantity !== null) placement.quantita = quantity;
++            const result = await api<{ project: Project }>('/api/measurement/place', { project, placements: [placement] });
++            onApply(result.project);
++        } catch (e) {
++            setError(e instanceof Error ? e.message : String(e));
++        } finally {
++            setBusy(false);
++        }
++    }
++
++    function remove() {
++        onApply({ ...project, measurementAssemblies: (project.measurementAssemblies || []).filter((m: MeasurementAssembly) => m.id !== measurementId) });
++    }
++
++    return <Modal open centered width={640} title={existing ? 'Multimetro e TA' : 'Aggiungi multimetro e TA'} onCancel={onClose}
++        footer={<Space>{existing && <Button danger onClick={remove}>Rimuovi misura</Button>}<Button onClick={onClose}>Annulla</Button><Button type="primary" loading={busy} onClick={() => void apply()}>{existing ? 'Applica' : 'Inserisci'}</Button></Space>}>
++        <div className="measurement-panel">
++            <div className="field"><span>1 · Dove vuoi misurare</span>
++                <Radio.Group value={mode} onChange={e => pickMode(e.target.value)}>
++                    {options.modi.map(m => <Radio.Button key={m.id} value={m.id} disabled={!m.disegnabile} title={m.motivo || undefined}>{m.etichetta}</Radio.Button>)}
++                </Radio.Group>
++                {options.modi.some(m => !m.disegnabile) && <small>{options.modi.filter(m => !m.disegnabile).map(m => `${m.etichetta}: ${m.motivo}`).join(' ')}</small>}
++            </div>
++            <div className="field"><span>2 · {mode === 'downstream_general' ? 'Interruttore generale' : 'Interruttore dell’utenza'}</span>
++                <Select showSearch value={device} onChange={setDevice} placeholder="Scegli l’interruttore" optionFilterProp="label"
++                    options={candidates.map(n => ({ value: n.id, label: describe(n) }))}/>
++            </div>
++            <div className="field"><span>3 · Strumento</span>
++                <Select value={instrument} onChange={setInstrument} placeholder="Scegli lo strumento"
++                    options={options.strumenti.map(s => ({ value: s.articolo, label: `${s.articolo} · ${s.descrizione}` }))}/>
++            </div>
++            <div className="measurement-row">
++                <div className="field"><span>Rapporto TA (es. 100/5)</span><Input value={ratio} onChange={e => setRatio(e.target.value)} placeholder="Da confermare"/></div>
++                <div className="field"><span>Quantità TA</span><InputNumber min={1} max={3} value={quantity} onChange={v => setQuantity(v)} placeholder="Da confermare"/></div>
++            </div>
++            <small>Il TA viene collocato sul primario dell’interruttore scelto: le utenze a valle ripartono dopo il TA. Puoi spostarlo in seguito trascinando il TA su un altro blocco.</small>
++            {error && <Alert type="error" title={error}/>}
++        </div>
++    </Modal>;
++}
