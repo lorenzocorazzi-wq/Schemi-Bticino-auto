@@ -1,0 +1,918 @@
+From 81d24ce8f37ec132004e55318d98bfd29395cb39 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 14 Oct 2026 15:28:12 +0000
+Subject: [PATCH] Misura su linea con derivazioni: TA sul primario, corsia dopo
+ il modulo; codici da testo nei golden
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01P1wQxeTBMPYLN8ypNoL96f
+---
+ Alpha/engine.py              | 790 +++++++++++++++++------------------
+ Alpha/packing.py             |   2 +-
+ Alpha/pdf_annotazioni.py     |  23 +
+ strumenti/report_golden.py   |   6 +-
+ tests/test_packing_misura.py |  24 ++
+ 5 files changed, 447 insertions(+), 398 deletions(-)
+ create mode 100644 tests/test_packing_misura.py
+
+diff --git a/Alpha/engine.py b/Alpha/engine.py
+index d89aa7a..8251f4b 100644
+--- a/Alpha/engine.py
++++ b/Alpha/engine.py
+@@ -1,406 +1,406 @@
+-import sys,json,pathlib,re,math,uuid,zipfile,io,textwrap,subprocess,collections
+-ROOT=pathlib.Path(__file__).resolve().parent;STUDIO=ROOT.parent
+-sys.path.insert(0,str(ROOT))
+-import config
+-if config.percorso('python_packages'):sys.path.insert(0,str(config.percorso('python_packages')))
+-sys.path.insert(0,str(ROOT/'vendor'))
+-import ezdxf
+-from ezdxf import xref
+-from ezdxf.enums import TextEntityAlignment
+-from packing import plan_pages
+-from typography import fit_caption,fit_title
+-from device_attributes import attributes as device_attributes
+-from device_nameplate import nameplate as device_nameplate
+-from cross_references import build_registry
+-from switch_drawing import input_height,conductor_names,drawing_conductors,numbered_conductors,wire_marker,load_qs,marker_label_rows,explicit_wire_identifiers
+-from contactor_drawing import load as load_contactor
+-from series_composition import plan as plan_series
+-import libreria_moduli
+-CAT=json.loads((STUDIO/'catalogo/quadrosuite/icu_bticino_ereditato.json').read_text(encoding='utf-8'))['articoli']
+-overrides_path=ROOT/'catalogue_verified.json'
+-if overrides_path.is_file():
+- for article,values in json.loads(overrides_path.read_text(encoding='utf-8')).items():
+-  if article in CAT:CAT[article]={**CAT[article],**values}
+-REVIEW=json.loads((STUDIO/'catalogo/revisione_elettrotecnica.json').read_text(encoding='utf-8'))
+-SYMBOLS={m['id']:m for m in REVIEW['canonical_modules']}
+-SYMBOLS['KM']={'id':'KM','name':'Contatto potenza BTicino','ports':[{'xy':[0,0]},{'xy':[0,-20]}],'sourceBlock':'Ca-00_E_Bt','previewOnly':True}
+-FIELDS=[f[0] for f in json.loads((STUDIO/'modello_potenza.json').read_text(encoding='utf-8'))['fields']]
+-def classify(desc):
+- t=desc.lower()
+- if re.search(r'\bmodulo\s+diff(?:erenziale)?\b',t):return 'MOD_DIFF'
+- if 'differ puro' in t:return 'RCD'
+- if 'magn diff' in t or 'magn+diff' in t or 'magnetot+diff' in t or re.search(r'\b(?:mt|magnetot(?:ermico)?)\s*[+/-]?\s*diff',t):return 'MTD'
+- if 'magnetot' in t or re.search(r'\bmt\b',t):return 'MT'
+- if 'btdin-bda' in t:return 'MOD_DIFF'
+- if 'sezionat' in t or 'manovra' in t:return 'QS'
+- return None
+-def specs(article,record):
+- text=record['descrizione'];curr=re.search(r'(?<![\w])([\d]+(?:[.,]\d+)?)A\b',text);curve=re.search(r'curva\s*([A-Z]+)\b',text,re.I);diff=re.search(r'(\d+)\s*mA\b',text,re.I)
+- family=re.search(r'(\d+(?:[.,]\d+)?)\s*kA\b',text,re.I)
+- return {'article':article,'description':text,'kind':classify(text),'poles':record.get('pole_equivalence',record.get('poli')),'catalogue_poles':record.get('poli'),'current':float(curr[1].replace(',','.')) if curr else None,'curve':curve[1].upper() if curve else None,'diff_mA':int(diff[1]) if diff else None,'compatibility_family_kA':float(family[1].replace(',','.')) if family else None,'record':record}
+-PRODUCTS=[specs(a,r) for a,r in CAT.items()]
+-def rating(p,voltage,basis):
+- r=p['record'];value=r.get(f'{basis.lower()}_{voltage}V_'+('A' if basis=='Icn' else 'kA'))
+- # Pole-specific table takes precedence over a flattened family value.
+- # Inherited GN 4P records also carry the 1P+N 230V Icu in that flat field.
+- table=r.get(f'{basis.lower()}_{voltage}V')
+- if isinstance(table,dict) and p['poles'] in table:value=table[p['poles']]
+- return value/1000 if value is not None and basis=='Icn' else value
+-
+-def validate_device_rating(node,settings):
+- # Recompute from the selected article, including imported red-code nodes.
+- # Stored proposal metadata is not proof of a rating after an edit.
+- values=node.get('values',{});article=values.get('articolo','')
+- record=CAT.get(article)
+- if not record:raise ValueError('Rating di catalogo non disponibile per '+node['sigla']+' / '+article)
+- raw=str(values.get('tensione','')).strip()
+- voltage_match=re.fullmatch(r'(230|400)\s*[Vv]?',raw)
+- if not voltage_match:raise ValueError('Indicare la tensione 230 V o 400 V per verificare i kA di '+node['sigla'])
+- voltage=int(voltage_match[1]);basis=settings.get('basis')
+- if basis not in ['Icu','Icn']:raise ValueError('Indicare Icu oppure Icn per la verifica del quadro.')
+- minimum=float(settings.get('ka3' if voltage==400 else 'ka1',0))
+- if not math.isfinite(minimum) or minimum<=0:raise ValueError('Inserire i kA richiesti per il quadro.')
+- actual=rating(specs(article,record),voltage,basis)
+- if actual is None:raise ValueError(f'{basis} a {voltage} V non documentato per {article} / '+node['sigla'])
+- if actual<minimum:raise ValueError(f'{node["sigla"]}: {article}, {basis} {actual:g} kA a {voltage} V, inferiore ai {minimum:g} kA richiesti.')
+- return {'article':article,'voltage':voltage,'basis':basis,'rated_kA':actual,'required_kA':minimum}
+-def select_device(request,settings):
+- kind=request.get('kind','MTD');poles=request.get('poles','4P');current=float(request.get('current',16));curve=request.get('curve','C');voltage=int(request.get('voltage') or (400 if poles in ['3P','4P'] else 230));basis=settings.get('basis','Icu');minimum=float(settings.get('ka3' if voltage==400 else 'ka1',10));diff=int(request.get('diff_mA',30));dtype=request.get('diff_type','A')
+- if voltage not in [230,400]:raise ValueError('Tensione di selezione non supportata: indicare 230 V o 400 V.')
+- if minimum<=0:raise ValueError('Inserire i kA richiesti per il quadro.')
+- candidates=[]
+- for p in PRODUCTS:
+-  exact_current=p['current']==current
+-  frame_trip_match=request.get('setting_current')==p['current'] and p['record'].get('case_class_A')==current
+-  if p['poles']!=poles or not (exact_current or frame_trip_match):continue
+-  if p['curve'] and p['curve']!=curve:continue
+-  r=rating(p,voltage,basis)
+-  if kind=='RCD' and p['kind']=='RCD':
+-   if p['diff_mA']!=diff or not re.search(r'\b'+re.escape(dtype)+r'\b',p['description']):continue
+-   r=None
+-  elif r is None or r<minimum:continue
+-  articles=[p['article']];warnings=[];final_kind=p['kind'];technical_review=False
+-  if kind=='MTD' and p['kind']=='MT':
+-   if request.get('diff_adjustable'):continue
+-   partners=[x for x in PRODUCTS if x['kind']=='MOD_DIFF' and x['poles']==poles and x['current'] is not None and x['current']>=current and x['diff_mA']==diff and re.search(r'\b'+re.escape(dtype)+r'(?:\b|-)',x['description']) and 'Associabile' in x['record'].get('nota','')]
+-   # The compatibility list names commercial BTDIN families, not Icu at the
+-   # operating voltage. A BTDIN60 2P may have Icu=20kA at 230V and still belong
+-   # to the 6kA family listed for the differential module.
+-   family=p['compatibility_family_kA']
+-   partners=[x for x in partners if family is not None and any(abs(float(n.replace(',','.'))-family)<1e-6 for n in re.findall(r'(\d+(?:[.,]\d+)?)',x['record'].get('nota','').split('Associabile')[-1]))]
+-   if not partners:continue
+-   partner=min(partners,key=lambda x:(x['current'],x['article']));articles.append(partner['article']);final_kind='MTD';warnings.append('Abbinamento da catalogo locale: verificare la compatibilità meccanica della coppia prima del rilascio.')
+-  elif p['kind']!=kind:continue
+-  if kind=='MTD' and p['kind']=='MTD':
+-   if request.get('diff_adjustable'):
+-    if not p['record'].get('diff_adjustable'):continue
+-    documented_type=p['record'].get('diff_type')
+-    if documented_type and documented_type!=dtype:continue
+-    if not documented_type:technical_review=True;warnings.append('Soglie regolabili documentate, tipo differenziale '+dtype+' non verificato: completare la verifica tecnica prima del definitivo.')
+-   elif p['diff_mA']!=diff or not re.search(r'\b'+re.escape(dtype)+r'\b',p['description']):continue
+-  if frame_trip_match:warnings.append('Classe costruttiva e regolazione selezionate separatamente: progetto '+str(int(current))+' R'+str(int(p['current']))+'.')
+-  if p['catalogue_poles']!=poles:warnings.append('Configurazione costruttiva '+str(p['catalogue_poles'])+': quattro poli con neutro /2, da confermare rispetto al progetto.')
+-  if kind=='MTD' and not p['curve']:warnings.append('Curva non esplicita nella descrizione locale: confermare la curva richiesta.')
+-  if kind=='RCD':warnings.append('Differenziale puro: richiede protezione e coordinamento a monte; nessun Icu/Icn proprio attribuito.')
+-  values={'costruttore':'BTICINO','articolo':p['article'],'utenza':request.get('label','Nuova utenza'),'taratura':poles+'/'+str(int(current))+'A','curva_Im':curve if kind!='RCD' else '', 'potere_interruzione':f'{r:g}kA' if r is not None else '', 'tensione':str(voltage)+'V','differenziale':dtype+'/REG' if request.get('diff_adjustable') else (f'{dtype}/{diff/1000:g}A' if kind in ['MTD','RCD'] else ''), 'accessorio_a':articles[1] if len(articles)>1 else '', 'fase':request.get('phase','')}
+-  candidates.append({'kind':final_kind,'articles':articles,'values':values,'required_kA':minimum,'rated_kA':r,'basis':basis,'voltage':voltage,'description':p['description'],'warnings':warnings,'requiresTechnicalReview':technical_review,'catalogue_poles':p['catalogue_poles'],'compatibility_family_kA':p['compatibility_family_kA'],'source':p['record'].get('verified_source','Quadrosuite / catalogo locale')})
+- # Equal electrical ratings should not select a higher commercial family just
+- # because its article sorts first alphabetically. This is a deterministic
+- # family preference, not a price comparison or substitution of Icu with Icn.
+- candidates.sort(key=lambda c:(c['rated_kA'] or 0,len(c['articles']),c['compatibility_family_kA'] or float('inf'),c['articles'][0]))
+- if not candidates:raise ValueError('Nessuna configurazione documentata soddisfa tutti i filtri. Icu e Icn non sono intercambiabili; valori mancanti non vengono inventati.')
+- return {'chosen':candidates[0],'alternatives':candidates[:20]}
+-def validate(project,require_confirmation=False):
+- if require_confirmation:
+-  from board_requirements import validate_requirements
+-  validate_requirements(project)
+-  pending=[c for c in project.get('unresolvedComponents',[]) if c.get('requiresIntegration')]
+-  if pending:raise ValueError('Componenti ancora da classificare o integrare: '+', '.join(c['article'] for c in pending[:8]))
+-  if project.get('protectiveNetworks'):raise ValueError('Rete PE rilevata nel progetto: integrazione dei collegamenti nel disegno ancora da completare.')
+-  if any(r.get('requiresIntegration') for r in project.get('measurementAssemblies',[])):raise ValueError('Moduli di misura rilevati: completare TA, protezione voltmetrica, ausiliari e rimandi prima del definitivo.')
+- nodes=project.get('nodes',[])
+- if not nodes:raise ValueError('Il progetto è vuoto.')
+- if len(nodes)>500:raise ValueError('Limite alpha: 500 apparecchi.')
+- ids={n['id'] for n in nodes}
+- if len(ids)!=len(nodes):raise ValueError('ID duplicati.')
+- sigs=[n.get('sigla','').strip() for n in nodes]
+- if any(not s for s in sigs) or len(set(sigs))!=len(sigs):raise ValueError('Le sigle devono essere presenti e univoche.')
+- byid={n['id']:n for n in nodes}
+- for n in nodes:
+-  lib_module=None if n.get('kind') in libreria_moduli.FISSI else libreria_moduli.scegli(codice=n.get('values',{}).get('articolo'),poli=n.get('values',{}).get('taratura'))
+-  if n.get('kind') not in libreria_moduli.FISSI and not lib_module:raise ValueError('Esportazione alpha: modulo non supportato.')
+-  if require_confirmation and lib_module and lib_module.get('stato')!='verificato':raise ValueError('Modulo di libreria da confermare per '+n['sigla']+'. Disponibile solo in BOZZA.')
+-  if require_confirmation and n['kind']=='KM':raise ValueError('Contattore '+n['sigla']+': circuito di comando e rimando alla bobina ancora da integrare. Disponibile solo in BOZZA.')
+-  if require_confirmation and n.get('selectionError'):raise ValueError('Configurazione da riselezionare: '+n['sigla'])
+-  if require_confirmation and n.get('requiresTechnicalReview'):raise ValueError('Verifica tecnica di catalogo incompleta: '+n['sigla'])
+-  if require_confirmation and n.get('connectionReview',{}).get('status')=='proposed':raise ValueError('Confermare individualmente il rimando senza sigla per '+n['sigla']+' nel diagramma.')
+-  if require_confirmation:
+-   for field,review in n.get('fieldReview',{}).items():
+-    if review.get('status')=='ambiguous':raise ValueError('Risolvere la lettura ambigua di '+field+' per '+n['sigla'])
+-  if require_confirmation and n.get('imported') and not n.get('values',{}).get('taratura'):raise ValueError('Completare poli e corrente del progetto per '+n['sigla'])
+-  if require_confirmation and not n.get('values',{}).get('articolo'):raise ValueError('Indicare articolo per '+n['sigla'])
+-  p=n.get('parent')
+-  if require_confirmation and (n.get('connectionStatus')=='da_definire' or (n.get('imported') and not p and n.get('connectionStatus')!='ingresso_esterno_esplicito')):
+-   raise ValueError('Alimentazione non determinata per '+n['sigla']+': scegliere il padre oppure indicare esplicitamente ingresso esterno nel diagramma.')
+-  if p and p not in ids:raise ValueError('Alimentazione inesistente: '+str(p))
+-  seen={n['id']}
+-  while p:
+-   if p in seen:raise ValueError('Collegamento circolare.')
+-   seen.add(p);p=byid[p].get('parent')
+-  if require_confirmation and n['kind']=='RCD':
+-   upstream=byid.get(n.get('parent'))
+-   if not upstream or upstream['kind'] not in ['MT','MTD']:raise ValueError('Il differenziale puro '+n['sigla']+' deve essere protetto da un MT/MTD a monte.')
+-  if require_confirmation and 'L?' in drawing_conductors(n,byid):raise ValueError('Indicare la fase L1/L2/L3 per '+n['sigla']+' prima della generazione.')
+-  if require_confirmation:
+-   conductors=conductor_names(n,byid);phase=n.get('values',{}).get('fase')
+-   phase_names=[c for c in conductors if c in ['L1','L2','L3']]
+-   if phase and phase not in ['L1','L2','L3']:raise ValueError('Fase non valida per '+n['sigla']+': usare L1/L2/L3.')
+-   if phase and len(phase_names)==1 and phase!=phase_names[0]:raise ValueError('Fase e marcature conduttori discordanti per '+n['sigla'])
+-   parent=byid.get(n.get('parent'));upstream=conductor_names(parent,byid) if parent else []
+-   if upstream and conductors and any(c not in upstream for c in conductors):raise ValueError('Conduttori incompatibili con alimentazione a monte per '+n['sigla'])
+-  if require_confirmation and (n.get('parent') or n.get('values',{}).get('taratura','').startswith('1P')) and n.get('values',{}).get('taratura','').startswith(('1P','2P')):
+-   phases=[c for c in conductor_names(n,byid) if c in ['L1','L2','L3']]
+-   phase=n.get('values',{}).get('fase')
+-   if len(phases)!=1 and phase not in ['L1','L2','L3']:raise ValueError('Indicare la fase L1/L2/L3 per '+n['sigla']+' prima della generazione.')
+-  if require_confirmation and n['kind'] in ['MT','MTD']:
+-   validate_device_rating(n,project['settings'])
+-  if require_confirmation and (not n.get('confirmed') or not n.get('connectionConfirmed')):raise ValueError('Confermare dati e alimentazione di '+n['sigla'])
+- project['avvisiLibreria']=libreria_moduli.valida(project) # solo avvisi, non blocca
+- return byid
+-def example():
+- d=json.loads((STUDIO/'apprendimento/regole_disegno_M26697.json').read_text(encoding='utf-8'));nodes=[]
+- bysig={r['sigla']:r for r in d['learned_devices'] if r['sigla'] and r['sigla'].startswith(('QF','QS'))}
+- raw=json.loads((STUDIO/'dati/112_M26697.json').read_text(encoding='utf-8'));texts=[e['dxf']['text'] for e in raw['entities'] if e['type']=='TEXT' and e['dxf'].get('text')]
+- for r in bysig.values():
+-  kind='QS' if r['sigla'].startswith('QS') else 'MTD'
+-  main=CAT.get(r['articles'][0]);actual=classify(main['descrizione']) if main else None
+-  if actual=='MT' and not any(a.startswith('G') for a in r['articles'][1:]):kind='MT'
+-  number=re.search(r'\d+',r['sigla'])[0];phases={m[1] for text in texts for m in re.finditer(r'\b(L[123])\.'+number+r'(?!\d)',text)}
+-  neutral=any(re.search(r'\bN'+number+r'(?!\d)',text) for text in texts)
+-  if len(phases)==1:r['values']['fase']=next(iter(phases))
+-  poles=r['values'].get('taratura') or r['values'].get('campo_regolazione','')
+-  if phases and ((poles.startswith(('1P','2P')) and len(phases)==1) or (poles.startswith(('3P','4P')) and len(phases)==3)):
+-   r['values']['conductors']=sorted(phases)+(['N'] if neutral else [])
+-  nodes.append({'id':r['sigla'],'sigla':r['sigla'],'label':r['label'],'kind':kind,'parent':r['feeder'] if r['feeder'] in bysig else None,'values':r['values'],'articles':r['articles'],'confirmed':False,'connectionConfirmed':False,'warnings':['Scelta dal vostro DWG finale; confermare i dati prima della generazione.']})
+- return {'name':'M26697 - riferimento di potenza','settings':{'ka3':10,'ka1':10,'basis':'Icu'},'nodes':nodes,'schemaVersion':1}
+-def export_project(project,preview_only=False,native_preview=False):
+- if project.get('hasMhq') is True and (not project.get('mhq',{}).get('exportId') or project.get('mhq',{}).get('status')!='ready'):raise ValueError('Fronte MHQ richiesto: caricare e verificare il file MHQ prima della generazione.')
+- byid=validate(project,not preview_only);token=uuid.uuid4().hex[:12];folder=ROOT/'exports'/token;folder.mkdir(parents=True)
+- projectfile=folder/'progetto.json';projectfile.write_text(json.dumps(project,ensure_ascii=False,indent=2),encoding='utf-8')
+- with zipfile.ZipFile(STUDIO/'libreria_templates.zip') as z:source=ezdxf.read(io.StringIO(z.read('112_M26697.dxf').decode('utf-8-sig'),newline=None))
+- meta=json.loads((STUDIO/'modello_potenza.json').read_text(encoding='utf-8'));refpage=next(p for p in meta['pages'] if p['file_key']=='112_M26697' and p['number']=='003');ox,oy=refpage['origin'];names={'bt_logo','bt_cartiglio','bt_doc_protection','bt_attc','bt_attf','bt_tabp_cavi-2','bt_tabdel_cavi'}
+- frames=[]
+- for e in source.modelspace().query('INSERT'):
+-  if e.dxf.name.lower() in names and ox-1<=e.dxf.insert.x<=ox+398.5 and oy-1<=e.dxf.insert.y<=oy+276:
+-   cp=e.copy();cp.translate(-ox,-oy,0);frames.append(cp)
+- source.modelspace().delete_all_entities()
+- for e in frames:source.modelspace().add_entity(e)
+- doc=ezdxf.new('R2018');doc.header['$INSUNITS']=4;doc.styles.get('Standard').dxf.font='arial.ttf';frame=doc.blocks.new('BT_FRAME');loader=xref.Loader(source,doc,conflict_policy=xref.ConflictPolicy.NUM_PREFIX);loader.load_modelspace(target_layout=frame);loader.execute()
+- for kind in ['MT','MTD','RCD']:
+-  s=ezdxf.readfile(STUDIO/SYMBOLS[kind]['dxf']);b=doc.blocks.new('BT_'+kind);loader=xref.Loader(s,doc,conflict_policy=xref.ConflictPolicy.NUM_PREFIX);loader.load_modelspace(target_layout=b);loader.execute()
+- # Source QS body is already observed in the user's standard.
+- load_qs(source,doc)
+- load_contactor(source,doc)
+- auxiliary_blocks={}
+- auxiliary_articles={a for n in byid.values() for a in [n.get('values',{}).get(k,'') for k in ('accessorio_a','accessorio_b','accessorio_c')] if a=='F80RC05'}
+- auxiliary_articles.update(m.get('article') for n in byid.values() for m in n.get('catalogueModules',[]) if m.get('article'))
+- if auxiliary_articles:
+-  from auxiliary_drawing import load as load_auxiliary
+-  for article in sorted(auxiliary_articles):
+-   try:auxiliary_blocks[article]=load_auxiliary(doc,article)
+-   except ValueError:
+-    # Senza simbolo nativo: modulo di libreria, se presente; altrimenti errore invariato.
+-    lib_module=libreria_moduli.scegli(codice=article)
+-    if not lib_module or lib_module.get('tipo')=='composto':raise
+-    auxiliary_blocks[article]=libreria_moduli.blocco(doc,lib_module)
+- for kind in ['MT','MTD','RCD','QS','KM']:
+-  block=doc.blocks.get('BT_'+kind);present={a.dxf.tag for a in block.query('ATTDEF')}
+-  for index,tag in enumerate(['ARTICOLO','COSTRUTTORE','POLI','IN_A','CURVA','KA','IDN','TIPO_DIFF','PROJECT_IN_A','IR_A','CATALOGUE_POLES','PROJECT_KA','KA_BASIS','KA_VOLTAGE','KA_SOURCE','KA_REVIEW']):
+-   if tag not in present:block.add_attdef(tag,(0,-80-3*index),text='',dxfattribs={'flags':1,'height':1})
+- from measurement_composition import prepare as prepare_measurements,draw as draw_measurement
+- measurement_groups=prepare_measurements(doc,STUDIO,project.get('measurementAssemblies',[]))
+- if not set(measurement_groups).issubset(byid):raise ValueError('Linea misurata non presente nel diagramma: nessuna misura puo essere omessa.')
+- packed_nodes=[{**n,'drawingWidth':6} if n['id'] in measurement_groups else n for n in byid.values()]
+- pages,positions,children,inline_contacts=plan_series(packed_nodes)
+- inline_children={parent:child for child,parent in inline_contacts.items()}
+- has_front=project.get('hasMhq') is not False and bool(project.get('mhq',{}).get('exportId'))
++import sys,json,pathlib,re,math,uuid,zipfile,io,textwrap,subprocess,collections
++ROOT=pathlib.Path(__file__).resolve().parent;STUDIO=ROOT.parent
++sys.path.insert(0,str(ROOT))
++import config
++if config.percorso('python_packages'):sys.path.insert(0,str(config.percorso('python_packages')))
++sys.path.insert(0,str(ROOT/'vendor'))
++import ezdxf
++from ezdxf import xref
++from ezdxf.enums import TextEntityAlignment
++from packing import plan_pages
++from typography import fit_caption,fit_title
++from device_attributes import attributes as device_attributes
++from device_nameplate import nameplate as device_nameplate
++from cross_references import build_registry
++from switch_drawing import input_height,conductor_names,drawing_conductors,numbered_conductors,wire_marker,load_qs,marker_label_rows,explicit_wire_identifiers
++from contactor_drawing import load as load_contactor
++from series_composition import plan as plan_series
++import libreria_moduli
++import live_preview
++CAT=json.loads((STUDIO/'catalogo/quadrosuite/icu_bticino_ereditato.json').read_text(encoding='utf-8'))['articoli']
++overrides_path=ROOT/'catalogue_verified.json'
++if overrides_path.is_file():
++ for article,values in json.loads(overrides_path.read_text(encoding='utf-8')).items():
++  if article in CAT:CAT[article]={**CAT[article],**values}
++REVIEW=json.loads((STUDIO/'catalogo/revisione_elettrotecnica.json').read_text(encoding='utf-8'))
++SYMBOLS={m['id']:m for m in REVIEW['canonical_modules']}
++SYMBOLS['KM']={'id':'KM','name':'Contatto potenza BTicino','ports':[{'xy':[0,0]},{'xy':[0,-20]}],'sourceBlock':'Ca-00_E_Bt','previewOnly':True}
++FIELDS=[f[0] for f in json.loads((STUDIO/'modello_potenza.json').read_text(encoding='utf-8'))['fields']]
++def classify(desc):
++ t=desc.lower()
++ if re.search(r'\bmodulo\s+diff(?:erenziale)?\b',t):return 'MOD_DIFF'
++ if 'differ puro' in t:return 'RCD'
++ if 'magn diff' in t or 'magn+diff' in t or 'magnetot+diff' in t or re.search(r'\b(?:mt|magnetot(?:ermico)?)\s*[+/-]?\s*diff',t):return 'MTD'
++ if 'magnetot' in t or re.search(r'\bmt\b',t):return 'MT'
++ if 'btdin-bda' in t:return 'MOD_DIFF'
++ if 'sezionat' in t or 'manovra' in t:return 'QS'
++ return None
++def specs(article,record):
++ text=record['descrizione'];curr=re.search(r'(?<![\w])([\d]+(?:[.,]\d+)?)A\b',text);curve=re.search(r'curva\s*([A-Z]+)\b',text,re.I);diff=re.search(r'(\d+)\s*mA\b',text,re.I)
++ family=re.search(r'(\d+(?:[.,]\d+)?)\s*kA\b',text,re.I)
++ return {'article':article,'description':text,'kind':classify(text),'poles':record.get('pole_equivalence',record.get('poli')),'catalogue_poles':record.get('poli'),'current':float(curr[1].replace(',','.')) if curr else None,'curve':curve[1].upper() if curve else None,'diff_mA':int(diff[1]) if diff else None,'compatibility_family_kA':float(family[1].replace(',','.')) if family else None,'record':record}
++PRODUCTS=[specs(a,r) for a,r in CAT.items()]
++def rating(p,voltage,basis):
++ r=p['record'];value=r.get(f'{basis.lower()}_{voltage}V_'+('A' if basis=='Icn' else 'kA'))
++ # Pole-specific table takes precedence over a flattened family value.
++ # Inherited GN 4P records also carry the 1P+N 230V Icu in that flat field.
++ table=r.get(f'{basis.lower()}_{voltage}V')
++ if isinstance(table,dict) and p['poles'] in table:value=table[p['poles']]
++ return value/1000 if value is not None and basis=='Icn' else value
++
++def validate_device_rating(node,settings):
++ # Recompute from the selected article, including imported red-code nodes.
++ # Stored proposal metadata is not proof of a rating after an edit.
++ values=node.get('values',{});article=values.get('articolo','')
++ record=CAT.get(article)
++ if not record:raise ValueError('Rating di catalogo non disponibile per '+node['sigla']+' / '+article)
++ raw=str(values.get('tensione','')).strip()
++ voltage_match=re.fullmatch(r'(230|400)\s*[Vv]?',raw)
++ if not voltage_match:raise ValueError('Indicare la tensione 230 V o 400 V per verificare i kA di '+node['sigla'])
++ voltage=int(voltage_match[1]);basis=settings.get('basis')
++ if basis not in ['Icu','Icn']:raise ValueError('Indicare Icu oppure Icn per la verifica del quadro.')
++ minimum=float(settings.get('ka3' if voltage==400 else 'ka1',0))
++ if not math.isfinite(minimum) or minimum<=0:raise ValueError('Inserire i kA richiesti per il quadro.')
++ actual=rating(specs(article,record),voltage,basis)
++ if actual is None:raise ValueError(f'{basis} a {voltage} V non documentato per {article} / '+node['sigla'])
++ if actual<minimum:raise ValueError(f'{node["sigla"]}: {article}, {basis} {actual:g} kA a {voltage} V, inferiore ai {minimum:g} kA richiesti.')
++ return {'article':article,'voltage':voltage,'basis':basis,'rated_kA':actual,'required_kA':minimum}
++def select_device(request,settings):
++ kind=request.get('kind','MTD');poles=request.get('poles','4P');current=float(request.get('current',16));curve=request.get('curve','C');voltage=int(request.get('voltage') or (400 if poles in ['3P','4P'] else 230));basis=settings.get('basis','Icu');minimum=float(settings.get('ka3' if voltage==400 else 'ka1',10));diff=int(request.get('diff_mA',30));dtype=request.get('diff_type','A')
++ if voltage not in [230,400]:raise ValueError('Tensione di selezione non supportata: indicare 230 V o 400 V.')
++ if minimum<=0:raise ValueError('Inserire i kA richiesti per il quadro.')
++ candidates=[]
++ for p in PRODUCTS:
++  exact_current=p['current']==current
++  frame_trip_match=request.get('setting_current')==p['current'] and p['record'].get('case_class_A')==current
++  if p['poles']!=poles or not (exact_current or frame_trip_match):continue
++  if p['curve'] and p['curve']!=curve:continue
++  r=rating(p,voltage,basis)
++  if kind=='RCD' and p['kind']=='RCD':
++   if p['diff_mA']!=diff or not re.search(r'\b'+re.escape(dtype)+r'\b',p['description']):continue
++   r=None
++  elif r is None or r<minimum:continue
++  articles=[p['article']];warnings=[];final_kind=p['kind'];technical_review=False
++  if kind=='MTD' and p['kind']=='MT':
++   if request.get('diff_adjustable'):continue
++   partners=[x for x in PRODUCTS if x['kind']=='MOD_DIFF' and x['poles']==poles and x['current'] is not None and x['current']>=current and x['diff_mA']==diff and re.search(r'\b'+re.escape(dtype)+r'(?:\b|-)',x['description']) and 'Associabile' in x['record'].get('nota','')]
++   # The compatibility list names commercial BTDIN families, not Icu at the
++   # operating voltage. A BTDIN60 2P may have Icu=20kA at 230V and still belong
++   # to the 6kA family listed for the differential module.
++   family=p['compatibility_family_kA']
++   partners=[x for x in partners if family is not None and any(abs(float(n.replace(',','.'))-family)<1e-6 for n in re.findall(r'(\d+(?:[.,]\d+)?)',x['record'].get('nota','').split('Associabile')[-1]))]
++   if not partners:continue
++   partner=min(partners,key=lambda x:(x['current'],x['article']));articles.append(partner['article']);final_kind='MTD';warnings.append('Abbinamento da catalogo locale: verificare la compatibilità meccanica della coppia prima del rilascio.')
++  elif p['kind']!=kind:continue
++  if kind=='MTD' and p['kind']=='MTD':
++   if request.get('diff_adjustable'):
++    if not p['record'].get('diff_adjustable'):continue
++    documented_type=p['record'].get('diff_type')
++    if documented_type and documented_type!=dtype:continue
++    if not documented_type:technical_review=True;warnings.append('Soglie regolabili documentate, tipo differenziale '+dtype+' non verificato: completare la verifica tecnica prima del definitivo.')
++   elif p['diff_mA']!=diff or not re.search(r'\b'+re.escape(dtype)+r'\b',p['description']):continue
++  if frame_trip_match:warnings.append('Classe costruttiva e regolazione selezionate separatamente: progetto '+str(int(current))+' R'+str(int(p['current']))+'.')
++  if p['catalogue_poles']!=poles:warnings.append('Configurazione costruttiva '+str(p['catalogue_poles'])+': quattro poli con neutro /2, da confermare rispetto al progetto.')
++  if kind=='MTD' and not p['curve']:warnings.append('Curva non esplicita nella descrizione locale: confermare la curva richiesta.')
++  if kind=='RCD':warnings.append('Differenziale puro: richiede protezione e coordinamento a monte; nessun Icu/Icn proprio attribuito.')
++  values={'costruttore':'BTICINO','articolo':p['article'],'utenza':request.get('label','Nuova utenza'),'taratura':poles+'/'+str(int(current))+'A','curva_Im':curve if kind!='RCD' else '', 'potere_interruzione':f'{r:g}kA' if r is not None else '', 'tensione':str(voltage)+'V','differenziale':dtype+'/REG' if request.get('diff_adjustable') else (f'{dtype}/{diff/1000:g}A' if kind in ['MTD','RCD'] else ''), 'accessorio_a':articles[1] if len(articles)>1 else '', 'fase':request.get('phase','')}
++  candidates.append({'kind':final_kind,'articles':articles,'values':values,'required_kA':minimum,'rated_kA':r,'basis':basis,'voltage':voltage,'description':p['description'],'warnings':warnings,'requiresTechnicalReview':technical_review,'catalogue_poles':p['catalogue_poles'],'compatibility_family_kA':p['compatibility_family_kA'],'source':p['record'].get('verified_source','Quadrosuite / catalogo locale')})
++ # Equal electrical ratings should not select a higher commercial family just
++ # because its article sorts first alphabetically. This is a deterministic
++ # family preference, not a price comparison or substitution of Icu with Icn.
++ candidates.sort(key=lambda c:(c['rated_kA'] or 0,len(c['articles']),c['compatibility_family_kA'] or float('inf'),c['articles'][0]))
++ if not candidates:raise ValueError('Nessuna configurazione documentata soddisfa tutti i filtri. Icu e Icn non sono intercambiabili; valori mancanti non vengono inventati.')
++ return {'chosen':candidates[0],'alternatives':candidates[:20]}
++def validate(project,require_confirmation=False):
++ if require_confirmation:
++  from board_requirements import validate_requirements
++  validate_requirements(project)
++  pending=[c for c in project.get('unresolvedComponents',[]) if c.get('requiresIntegration')]
++  if pending:raise ValueError('Componenti ancora da classificare o integrare: '+', '.join(c['article'] for c in pending[:8]))
++  if project.get('protectiveNetworks'):raise ValueError('Rete PE rilevata nel progetto: integrazione dei collegamenti nel disegno ancora da completare.')
++  if any(r.get('requiresIntegration') for r in project.get('measurementAssemblies',[])):raise ValueError('Moduli di misura rilevati: completare TA, protezione voltmetrica, ausiliari e rimandi prima del definitivo.')
++ nodes=project.get('nodes',[])
++ if not nodes:raise ValueError('Il progetto è vuoto.')
++ if len(nodes)>500:raise ValueError('Limite alpha: 500 apparecchi.')
++ ids={n['id'] for n in nodes}
++ if len(ids)!=len(nodes):raise ValueError('ID duplicati.')
++ sigs=[n.get('sigla','').strip() for n in nodes]
++ if any(not s for s in sigs) or len(set(sigs))!=len(sigs):raise ValueError('Le sigle devono essere presenti e univoche.')
++ byid={n['id']:n for n in nodes}
++ for n in nodes:
++  lib_module=None if n.get('kind') in libreria_moduli.FISSI else libreria_moduli.scegli(codice=n.get('values',{}).get('articolo'),poli=n.get('values',{}).get('taratura'))
++  if n.get('kind') not in libreria_moduli.FISSI and not lib_module:raise ValueError('Esportazione alpha: modulo non supportato.')
++  if require_confirmation and lib_module and lib_module.get('stato')!='verificato':raise ValueError('Modulo di libreria da confermare per '+n['sigla']+'. Disponibile solo in BOZZA.')
++  if require_confirmation and n['kind']=='KM':raise ValueError('Contattore '+n['sigla']+': circuito di comando e rimando alla bobina ancora da integrare. Disponibile solo in BOZZA.')
++  if require_confirmation and n.get('selectionError'):raise ValueError('Configurazione da riselezionare: '+n['sigla'])
++  if require_confirmation and n.get('requiresTechnicalReview'):raise ValueError('Verifica tecnica di catalogo incompleta: '+n['sigla'])
++  if require_confirmation and n.get('connectionReview',{}).get('status')=='proposed':raise ValueError('Confermare individualmente il rimando senza sigla per '+n['sigla']+' nel diagramma.')
++  if require_confirmation:
++   for field,review in n.get('fieldReview',{}).items():
++    if review.get('status')=='ambiguous':raise ValueError('Risolvere la lettura ambigua di '+field+' per '+n['sigla'])
++  if require_confirmation and n.get('imported') and not n.get('values',{}).get('taratura'):raise ValueError('Completare poli e corrente del progetto per '+n['sigla'])
++  if require_confirmation and not n.get('values',{}).get('articolo'):raise ValueError('Indicare articolo per '+n['sigla'])
++  p=n.get('parent')
++  if require_confirmation and (n.get('connectionStatus')=='da_definire' or (n.get('imported') and not p and n.get('connectionStatus')!='ingresso_esterno_esplicito')):
++   raise ValueError('Alimentazione non determinata per '+n['sigla']+': scegliere il padre oppure indicare esplicitamente ingresso esterno nel diagramma.')
++  if p and p not in ids:raise ValueError('Alimentazione inesistente: '+str(p))
++  seen={n['id']}
++  while p:
++   if p in seen:raise ValueError('Collegamento circolare.')
++   seen.add(p);p=byid[p].get('parent')
++  if require_confirmation and n['kind']=='RCD':
++   upstream=byid.get(n.get('parent'))
++   if not upstream or upstream['kind'] not in ['MT','MTD']:raise ValueError('Il differenziale puro '+n['sigla']+' deve essere protetto da un MT/MTD a monte.')
++  if require_confirmation and 'L?' in drawing_conductors(n,byid):raise ValueError('Indicare la fase L1/L2/L3 per '+n['sigla']+' prima della generazione.')
++  if require_confirmation:
++   conductors=conductor_names(n,byid);phase=n.get('values',{}).get('fase')
++   phase_names=[c for c in conductors if c in ['L1','L2','L3']]
++   if phase and phase not in ['L1','L2','L3']:raise ValueError('Fase non valida per '+n['sigla']+': usare L1/L2/L3.')
++   if phase and len(phase_names)==1 and phase!=phase_names[0]:raise ValueError('Fase e marcature conduttori discordanti per '+n['sigla'])
++   parent=byid.get(n.get('parent'));upstream=conductor_names(parent,byid) if parent else []
++   if upstream and conductors and any(c not in upstream for c in conductors):raise ValueError('Conduttori incompatibili con alimentazione a monte per '+n['sigla'])
++  if require_confirmation and (n.get('parent') or n.get('values',{}).get('taratura','').startswith('1P')) and n.get('values',{}).get('taratura','').startswith(('1P','2P')):
++   phases=[c for c in conductor_names(n,byid) if c in ['L1','L2','L3']]
++   phase=n.get('values',{}).get('fase')
++   if len(phases)!=1 and phase not in ['L1','L2','L3']:raise ValueError('Indicare la fase L1/L2/L3 per '+n['sigla']+' prima della generazione.')
++  if require_confirmation and n['kind'] in ['MT','MTD']:
++   validate_device_rating(n,project['settings'])
++  if require_confirmation and (not n.get('confirmed') or not n.get('connectionConfirmed')):raise ValueError('Confermare dati e alimentazione di '+n['sigla'])
++ project['avvisiLibreria']=libreria_moduli.valida(project) # solo avvisi, non blocca
++ return byid
++def example():
++ d=json.loads((STUDIO/'apprendimento/regole_disegno_M26697.json').read_text(encoding='utf-8'));nodes=[]
++ bysig={r['sigla']:r for r in d['learned_devices'] if r['sigla'] and r['sigla'].startswith(('QF','QS'))}
++ raw=json.loads((STUDIO/'dati/112_M26697.json').read_text(encoding='utf-8'));texts=[e['dxf']['text'] for e in raw['entities'] if e['type']=='TEXT' and e['dxf'].get('text')]
++ for r in bysig.values():
++  kind='QS' if r['sigla'].startswith('QS') else 'MTD'
++  main=CAT.get(r['articles'][0]);actual=classify(main['descrizione']) if main else None
++  if actual=='MT' and not any(a.startswith('G') for a in r['articles'][1:]):kind='MT'
++  number=re.search(r'\d+',r['sigla'])[0];phases={m[1] for text in texts for m in re.finditer(r'\b(L[123])\.'+number+r'(?!\d)',text)}
++  neutral=any(re.search(r'\bN'+number+r'(?!\d)',text) for text in texts)
++  if len(phases)==1:r['values']['fase']=next(iter(phases))
++  poles=r['values'].get('taratura') or r['values'].get('campo_regolazione','')
++  if phases and ((poles.startswith(('1P','2P')) and len(phases)==1) or (poles.startswith(('3P','4P')) and len(phases)==3)):
++   r['values']['conductors']=sorted(phases)+(['N'] if neutral else [])
++  nodes.append({'id':r['sigla'],'sigla':r['sigla'],'label':r['label'],'kind':kind,'parent':r['feeder'] if r['feeder'] in bysig else None,'values':r['values'],'articles':r['articles'],'confirmed':False,'connectionConfirmed':False,'warnings':['Scelta dal vostro DWG finale; confermare i dati prima della generazione.']})
++ return {'name':'M26697 - riferimento di potenza','settings':{'ka3':10,'ka1':10,'basis':'Icu'},'nodes':nodes,'schemaVersion':1}
++def export_project(project,preview_only=False,native_preview=False):
++ if project.get('hasMhq') is True and (not project.get('mhq',{}).get('exportId') or project.get('mhq',{}).get('status')!='ready'):raise ValueError('Fronte MHQ richiesto: caricare e verificare il file MHQ prima della generazione.')
++ byid=validate(project,not preview_only);token=uuid.uuid4().hex[:12];folder=ROOT/'exports'/token;folder.mkdir(parents=True)
++ projectfile=folder/'progetto.json';projectfile.write_text(json.dumps(project,ensure_ascii=False,indent=2),encoding='utf-8')
++ with zipfile.ZipFile(STUDIO/'libreria_templates.zip') as z:source=ezdxf.read(io.StringIO(z.read('112_M26697.dxf').decode('utf-8-sig'),newline=None))
++ meta=json.loads((STUDIO/'modello_potenza.json').read_text(encoding='utf-8'));refpage=next(p for p in meta['pages'] if p['file_key']=='112_M26697' and p['number']=='003');ox,oy=refpage['origin'];names={'bt_logo','bt_cartiglio','bt_doc_protection','bt_attc','bt_attf','bt_tabp_cavi-2','bt_tabdel_cavi'}
++ frames=[]
++ for e in source.modelspace().query('INSERT'):
++  if e.dxf.name.lower() in names and ox-1<=e.dxf.insert.x<=ox+398.5 and oy-1<=e.dxf.insert.y<=oy+276:
++   cp=e.copy();cp.translate(-ox,-oy,0);frames.append(cp)
++ source.modelspace().delete_all_entities()
++ for e in frames:source.modelspace().add_entity(e)
++ doc=ezdxf.new('R2018');doc.header['$INSUNITS']=4;doc.styles.get('Standard').dxf.font='arial.ttf';frame=doc.blocks.new('BT_FRAME');loader=xref.Loader(source,doc,conflict_policy=xref.ConflictPolicy.NUM_PREFIX);loader.load_modelspace(target_layout=frame);loader.execute()
++ for kind in ['MT','MTD','RCD']:
++  s=ezdxf.readfile(STUDIO/SYMBOLS[kind]['dxf']);b=doc.blocks.new('BT_'+kind);loader=xref.Loader(s,doc,conflict_policy=xref.ConflictPolicy.NUM_PREFIX);loader.load_modelspace(target_layout=b);loader.execute()
++ # Source QS body is already observed in the user's standard.
++ load_qs(source,doc)
++ load_contactor(source,doc)
++ auxiliary_blocks={}
++ auxiliary_articles={a for n in byid.values() for a in [n.get('values',{}).get(k,'') for k in ('accessorio_a','accessorio_b','accessorio_c')] if a=='F80RC05'}
++ auxiliary_articles.update(m.get('article') for n in byid.values() for m in n.get('catalogueModules',[]) if m.get('article'))
++ if auxiliary_articles:
++  from auxiliary_drawing import load as load_auxiliary
++  for article in sorted(auxiliary_articles):
++   try:auxiliary_blocks[article]=load_auxiliary(doc,article)
++   except ValueError:
++    # Senza simbolo nativo: modulo di libreria, se presente; altrimenti errore invariato.
++    lib_module=libreria_moduli.scegli(codice=article)
++    if not lib_module or lib_module.get('tipo')=='composto':raise
++    auxiliary_blocks[article]=libreria_moduli.blocco(doc,lib_module)
++ for kind in ['MT','MTD','RCD','QS','KM']:
++  block=doc.blocks.get('BT_'+kind);present={a.dxf.tag for a in block.query('ATTDEF')}
++  for index,tag in enumerate(['ARTICOLO','COSTRUTTORE','POLI','IN_A','CURVA','KA','IDN','TIPO_DIFF','PROJECT_IN_A','IR_A','CATALOGUE_POLES','PROJECT_KA','KA_BASIS','KA_VOLTAGE','KA_SOURCE','KA_REVIEW']):
++   if tag not in present:block.add_attdef(tag,(0,-80-3*index),text='',dxfattribs={'flags':1,'height':1})
++ from measurement_composition import prepare as prepare_measurements,draw as draw_measurement
++ measurement_groups=prepare_measurements(doc,STUDIO,project.get('measurementAssemblies',[]))
++ if not set(measurement_groups).issubset(byid):raise ValueError('Linea misurata non presente nel diagramma: nessuna misura puo essere omessa.')
++ packed_nodes=[{**n,'drawingWidth':6} if n['id'] in measurement_groups else n for n in byid.values()]
++ pages,positions,children,inline_contacts=plan_series(packed_nodes)
++ inline_children={parent:child for child,parent in inline_contacts.items()}
++ has_front=project.get('hasMhq') is not False and bool(project.get('mhq',{}).get('exportId'))
+  from cover_page import reserve_front_pages,append_title_cover,append_index,project_metadata,fit_title_attribute
+  reserve_front_pages(pages,positions)
+- if any(children[r.get('measuredFeeder')] for r in project.get('measurementAssemblies',[])):
+-  raise ValueError('Misura su alimentazione con derivazioni interne: instradamento del primario ancora da integrare. La bozza non puo bypassare il TA.')
+- measurement_feeders=set(measurement_groups)
++ measurement_feeders=set(measurement_groups)
+  total_pages=len(pages)+2+int(has_front)
+- destinations=collections.defaultdict(list)
+- for page in pages:
+-  for group in page['groups']:
+-   if group['parent']:destinations[group['parent']].append({'page':page['number'],'group':group})
+- references=build_registry(pages,positions,list(byid.values()))
+- (folder/'rimandi.json').write_text(json.dumps(references,ensure_ascii=False,indent=2),encoding='utf-8')
+- for role in ('P','A'):
+-  block=doc.blocks.new('BT_RIMANDO_'+role)
+-  for tag in ['SEGNALE','PRES','#LINEA','REG','FOGLIO','CATENARIA','NET_ID','ENDPOINT_ID','PARTNER_ID']:
+-   block.add_attdef(tag,(0,0),text='',dxfattribs={'flags':1,'height':1})
+- m=doc.modelspace();doc.layers.new('VIEWPORTS',dxfattribs={'plot':0});report=[]
+- def text(value,x,y,h=1.8):return m.add_text(str(value),dxfattribs={'height':h,'style':'Standard'}).set_placement((x,y),align=TextEntityAlignment.MIDDLE_CENTER)
+- def line(a,b):m.add_line(a,b,dxfattribs={'color':4})
+- fieldrows={name:(low+high)/2 for name,low,high in meta['fields']}
+- title_metadata=project_metadata(project)
+- title_lines=[title_metadata['IMPIANTO1'],title_metadata['IMPIANTO2']]
+- for i,packed in enumerate(pages):
+-  physical=packed['number'];sy=-315*(physical-1);sheet=f'{physical:03}';pageframe=m.add_blockref('BT_FRAME',(0,sy))
+-  # Independent frame instances keep their own footer values.
+-  for e in list(frame):
+-   if e.dxftype()=='INSERT':
+-    if e.dxf.name.lower()=='bt_tabdel_cavi' and (i!=0 or packed['start_column']<2):continue
+-    cp=e.copy();cp.translate(0,sy,0);m.add_entity(cp)
+-    for a in cp.attribs:
+-     roots=children[None];main_current=byid[roots[0]]['values'].get('taratura','').split('/')[-1].replace('A','') if len(roots)==1 else '-'
+-     replacements={'NUMFOG':sheet,'NUMFOGSEG':f'{physical+1:03}' if physical<total_pages else '-','DISEGNATORE':'ALPHA BTICINO','APPROVATO':'DA VERIFICARE','IMPIANTO1':project.get('name','QUADRO'),'IMPIANTO2':'','NOME_FILE':'schema.dwg','COMMESSA':'ALPHA','O.D.L':'-','TIPO_CAD':'AutoCAD','CORRENTE_NOMINALE1':main_current,'CORRENTE_CC':'-','TENSIONE_NOMINALE_IS':'-','TIPO_SISTEMA':'-','DATAEMISS':'-','DATAREV':'-'}
+-     replacements.update(title_metadata)
+-     if cp.dxf.name.lower()=='bt_attc' and a.dxf.tag in replacements:a.dxf.text=replacements[a.dxf.tag]
+-     if cp.dxf.name.lower()=='bt_attc' and a.dxf.tag in ['IMPIANTO1','IMPIANTO2']:
+-      index=0 if a.dxf.tag=='IMPIANTO1' else 1
+-      a.dxf.text=title_lines[index] if index<len(title_lines) else ''
+-      fit_title_attribute(a)
+-     if cp.dxf.name.lower()=='bt_tabdel_cavi':
+-      board=project.get('board',{});characteristics={'TENSIONE_NOMINALE':board.get('voltage','-'),'TENSIONE_NOMINALE_IS':board.get('insulation','-'),'FREQUENZA_NOMINALE':board.get('frequency','-'),'CORRENTE_NOMINALE1':board.get('current',main_current),'CORRENTE_CC':board.get('short_circuit','-'),'CORRENTE_NOMINALE_AMM':board.get('short_time','-'),'TENSIONE_NOM_AUS_AC':board.get('aux_ac','-'),'TENSIONE_NOM_AUS_DC':board.get('aux_dc','-'),'TIPO_SISTEMA':board.get('system','-')}
+-      if a.dxf.tag in characteristics:a.dxf.text=str(characteristics[a.dxf.tag])
+-  m.delete_entity(pageframe)
+-  text(sheet,385,sy+7.5,2.5);text(f'{physical+1:03}' if physical<total_pages else '-',385,sy+2.5,2.5)
+-  text(title_metadata['REVISIONE'],120,sy+12.5,1.8);text(title_metadata['DATAREV'],177.5,sy+12.5,1.8)
+-  if preview_only:text('BOZZA - DATI E ALIMENTAZIONI NON CONFERMATI',230,sy+267,2.3)
+-  # Draw only the buses belonging to each feed; never merge unrelated parents.
+-  for group in packed['groups']:
+-   parent=group['parent'];items=group['items'];bus_y=sy+group['bus_y'];first_x=items[0]['x'] if items else group['incoming_x'];last_x=group['last_x']
+-   if parent and positions[parent]['page']==physical:
+-    px=positions[parent]['x'];lane=packed['lanes'][parent]
+-    line((px,sy+142.5),(lane,sy+142.5));line((lane,sy+142.5),(lane,bus_y));line((lane,bus_y),(last_x,bus_y))
+-   elif parent:
+-    line((group['incoming_x'],bus_y),(last_x,bus_y))
+-   elif len(items)==1 and packed['external_column'] is not None:
+-    entry=80+25*packed['external_column'];line((entry,sy+142.5),(entry,bus_y));line((entry,bus_y),(last_x,bus_y));m.add_circle((entry,sy+142.5),1.2)
+-    root=byid[items[0]['id']]
+-    unknown=root.get('connectionStatus')=='da_definire' or (root.get('imported') and root.get('connectionStatus')!='ingresso_esterno_esplicito')
+-    text('ALIM. DA DEFINIRE' if unknown else 'ARRIVO LINEA',entry,sy+137.5,1.4)
+-   else:
+-    if parent is None and packed['external_column'] is not None:
+-     entry=80+25*packed['external_column']
+-     line((entry,sy+142.5),(entry,bus_y));line((entry,bus_y),(last_x,bus_y));m.add_circle((entry,sy+142.5),1.2)
+-     source=byid[items[0]['id']].get('values',{}).get('externalSupplyLabel','ARRIVO LINEA')
+-     text(source,entry,sy+137.5,1.25)
+-    else:
+-     line((first_x,bus_y),(last_x,bus_y));text('ALIM. DA DEFINIRE',first_x,bus_y+3,1.3)
+-   if group.get('outgoing_reference'):
+-    line((last_x,bus_y),(group['outgoing_x'],bus_y))
+-   if parent:
+-    wire_names=numbered_conductors(byid[parent],byid,drawing_conductors(byid[parent],byid))
+-    start=packed['lanes'][parent] if positions[parent]['page']==physical else group['incoming_x']
+-    end=group['outgoing_x'] if group.get('outgoing_reference') else last_x
+-    if wire_names and end-start>=25:text(' '.join(wire_names),(start+end)/2,bus_y+2.5,1.5)
+-   for item in items:
+-    n=byid[item['id']];input_y=sy+min(input_height(n,byid),group['bus_y']-12)
+-    line((item['x'],bus_y),(item['x'],input_y));m.add_circle((item['x'],bus_y),.45)
+-  drawn_measurements=[]
+-  for item in packed['items']:
+-   n=byid[item['id']];x=item['x'];kind=n['kind'];is_inline=n['id'] in inline_contacts
+-   feed_group=None if is_inline else next(g for g in packed['groups'] if item in g['items'])
+-   input_y=sy+input_height(n,byid) if is_inline else sy+min(input_height(n,byid),feed_group['bus_y']-12)
+-   values=n['values'];lib_module=None if kind in libreria_moduli.FISSI else libreria_moduli.scegli(codice=values.get('articolo'),poli=values.get('taratura'))
+-   scale,length=libreria_moduli.ingombro(lib_module) if lib_module else (1,20 if kind=='QS' else abs(SYMBOLS[kind]['ports'][-1]['xy'][1]))
+-   primary=values.get('articolo','');product=specs(primary,CAT[primary]) if primary in CAT else None;plate=device_nameplate(n,product,project.get('settings',{}));attrs=device_attributes(n,product,plate)
+-   if kind=='KM':attrs.update(RELE=values.get('coilTag',''),**{'POSIZIONE-BOBINA':values.get('coilReference') or '[DA VERIF.]'})
+-   if lib_module:ref,_=libreria_moduli.inserisci(doc,m,lib_module['id'],(x,input_y),{'SIGLA':n['sigla'],'CODICE':primary,**attrs},scale,poli=values.get('taratura'))
+-   else:ref=m.add_blockref('BT_'+kind,(x,input_y));ref.add_auto_attribs(attrs)
+-   if 'F80RC05' in auxiliary_blocks and 'F80RC05' in [values.get(k,'') for k in ('accessorio_a','accessorio_b','accessorio_c')]:
+-    # F80RC05's native listino block is a separate changeover status contact;
+-    # place it beside the protected device, not in series with its power poles.
+-    aux=m.add_blockref(auxiliary_blocks['F80RC05'],(x+9,input_y))
+-    aux.add_auto_attribs({'SIGLA':n['sigla']+'_ST','ARTICOLO':'F80RC05','COSTRUTTORE':'BTICINO'})
+-   # Non-breaker red-code apparatus stays visible in a draft as native
+-   # catalogue geometry, positioned beside its proposed related branch.
+-   modules=n.get('catalogueModules',[])
+-   module_offsets={1:[9],2:[-9,9],3:[-15,0,15]}.get(len(modules),[9])
+-   for module,dx in zip(modules,module_offsets):
+-    article=module.get('article');block=auxiliary_blocks.get(article)
+-    if not block:continue
+-    aux=m.add_blockref(block,(x+dx,input_y))
+-    aux.add_auto_attribs({'SIGLA':n['sigla']+'_ACC','ARTICOLO':article,'COSTRUTTORE':'BTICINO'})
+-   inline_child=byid.get(inline_children.get(n['id']))
+-   output_end=sy+input_height(inline_child,byid) if inline_child else sy+142.5
+-   if output_end>=input_y-length:raise ValueError('Moduli in serie sovrapposti: '+n['sigla'])
+-   line((x,input_y-length),(x,output_end))
+-   if n.get('connectionReview',{}).get('status')=='proposed':
+-    text('RIMANDO',x+7,input_y-5,1.2);text('DA VERIF.',x+7,input_y-7,1.2)
+-   phase=values.get('fase')
+-   names=drawing_conductors(n,byid);conductors=numbered_conductors(n,byid,names)
+-   if is_inline and not explicit_wire_identifiers(n):
+-    # Own standard adds A to outgoing wire identity after the series contact.
+-    conductors=[v+'A' for v in numbered_conductors(byid[n['parent']],byid,names)]
+-   if conductors:
+-    # L? is explicitly unresolved; incoming identifiers belong to the feeder.
+-    incoming=numbered_conductors(byid[n['parent']],byid,names) if n.get('parent') else conductors
+-    output_marker=(input_y-length+output_end)/2 if inline_child else min(sy+160.85,input_y-length-7)
+-    markers=[(output_marker,conductors)] if is_inline else [(input_y+5.25,incoming),(output_marker,conductors)]
+-    for marker_y,labels in markers:
+-     if not labels:continue
+-     marker=wire_marker(names)
+-     if marker:m.add_blockref(marker,(x,marker_y))
+-     for caption,dx,dy in marker_label_rows(labels):
+-      m.add_text(caption,dxfattribs={'height':1.5,'style':'Standard'}).set_placement((x+dx,marker_y+dy),align=TextEntityAlignment.LEFT)
+-   elif phase:text(phase,x+7,sy+175,1.6)
+-   if not children[n['id']] and n['id'] not in measurement_feeders:m.add_circle((x,sy+142.5),1.2)
+-   if n['id'] in measurement_groups:
+-    if feed_group['bus_y']<250:raise ValueError('Misura su barra troppo bassa: instradamento da completare senza sovrapposizioni.')
+-    drawn_measurements.append(draw_measurement(doc,measurement_groups[n['id']],x,sy,text,line,n,fieldrows))
+-   if is_inline:continue # Contact attributes retain its own article; one circuit cartiglio.
+-   text(n['sigla'],x,sy+127.5)
+-   for k,y in fieldrows.items():
+-    if n['id'] in measurement_groups and k in ['tipo_cavo','composizione_cavo','lunghezza_m']:continue
+-    value=n['label'] if k=='utenza' else values.get(k,'')
+-    if n.get('fieldReview',{}).get(k,{}).get('status')=='ambiguous':value='DA VERIF.'
+-    if k=='taratura' and values.get('conflict_current'):value='DA VERIF.'
+-    if k=='potere_interruzione' and kind in ['MT','MTD']:value=plate['display']
+-    if kind=='QS':
+-     if k=='campo_regolazione' and not value:value=values.get('taratura','')
+-     elif k=='taratura':value=''
+-    if not value:continue
+-    lines,height=fit_caption(value) if k=='utenza' else ([str(value)],1.8)
+-    if k!='utenza' and len(str(value))>28:raise ValueError('Dato troppo lungo per la colonna: '+n['sigla']+' '+k)
+-    step=height*1.45
+-    for row,val in enumerate(lines):text(val,x,sy+y+(len(lines)-1)*step/2-row*step,height)
+-  sheet_references=[e for e in references if e['sheet']==physical]
+-  for endpoint in sheet_references:
+-   x,y=endpoint['xy'];anchor=(x,sy+y)
+-   ref=m.add_blockref('BT_RIMANDO_'+endpoint['role'],anchor)
+-   ref.add_auto_attribs({'SEGNALE':endpoint['signal'],'PRES':endpoint['role'],'#LINEA':endpoint['branch'],'REG':endpoint['target'],'FOGLIO':sheet,'CATENARIA':endpoint['address'].split('-',1)[1],'NET_ID':str(endpoint['net']),'ENDPOINT_ID':endpoint['id'],'PARTNER_ID':endpoint['partner']})
+-   text(endpoint['text'],x+(8 if y==142.5 else 0),sy+y+3,1.5)
+-  ps=doc.layouts.new('A4_'+sheet);ps.page_setup(size=(297,210),margins=(7.5,7.5,7.5,7.5),units='mm',device='DWG To PDF.pc3');ps.main_viewport().dxf.layer='0';ps.add_viewport(center=(141,97.5),size=(195*397.5/275,195),view_center_point=(198.75,sy+137.5),view_height=275,dxfattribs={'layer':'VIEWPORTS','flags':16384});report.append({'sheet':sheet,'feeds':[v['parent'] for v in packed['groups']],'devices':[byid[v['id']]['sigla'] for v in packed['items']],'references':[e['id'] for e in sheet_references],'used_columns':packed['used_columns'],'layout':ps.name,'measurements':drawn_measurements})
+- if has_front:
+-  from mhq_import import append_front
+-  report.append(append_front(doc,project['mhq'],total_pages,frame,project,preview_only))
++ destinations=collections.defaultdict(list)
++ for page in pages:
++  for group in page['groups']:
++   if group['parent']:destinations[group['parent']].append({'page':page['number'],'group':group})
++ references=build_registry(pages,positions,list(byid.values()))
++ (folder/'rimandi.json').write_text(json.dumps(references,ensure_ascii=False,indent=2),encoding='utf-8')
++ for role in ('P','A'):
++  block=doc.blocks.new('BT_RIMANDO_'+role)
++  for tag in ['SEGNALE','PRES','#LINEA','REG','FOGLIO','CATENARIA','NET_ID','ENDPOINT_ID','PARTNER_ID']:
++   block.add_attdef(tag,(0,0),text='',dxfattribs={'flags':1,'height':1})
++ m=live_preview.watch(doc.modelspace());live_preview.phase('Disegno pagine…');doc.layers.new('VIEWPORTS',dxfattribs={'plot':0});report=[]
++ def text(value,x,y,h=1.8):return m.add_text(str(value),dxfattribs={'height':h,'style':'Standard'}).set_placement((x,y),align=TextEntityAlignment.MIDDLE_CENTER)
++ def line(a,b):m.add_line(a,b,dxfattribs={'color':4})
++ fieldrows={name:(low+high)/2 for name,low,high in meta['fields']}
++ title_metadata=project_metadata(project)
++ title_lines=[title_metadata['IMPIANTO1'],title_metadata['IMPIANTO2']]
++ for i,packed in enumerate(pages):
++  physical=packed['number'];sy=-315*(physical-1);sheet=f'{physical:03}';pageframe=m.add_blockref('BT_FRAME',(0,sy))
++  # Independent frame instances keep their own footer values.
++  for e in list(frame):
++   if e.dxftype()=='INSERT':
++    if e.dxf.name.lower()=='bt_tabdel_cavi' and (i!=0 or packed['start_column']<2):continue
++    cp=e.copy();cp.translate(0,sy,0);m.add_entity(cp)
++    for a in cp.attribs:
++     roots=children[None];main_current=byid[roots[0]]['values'].get('taratura','').split('/')[-1].replace('A','') if len(roots)==1 else '-'
++     replacements={'NUMFOG':sheet,'NUMFOGSEG':f'{physical+1:03}' if physical<total_pages else '-','DISEGNATORE':'ALPHA BTICINO','APPROVATO':'DA VERIFICARE','IMPIANTO1':project.get('name','QUADRO'),'IMPIANTO2':'','NOME_FILE':'schema.dwg','COMMESSA':'ALPHA','O.D.L':'-','TIPO_CAD':'AutoCAD','CORRENTE_NOMINALE1':main_current,'CORRENTE_CC':'-','TENSIONE_NOMINALE_IS':'-','TIPO_SISTEMA':'-','DATAEMISS':'-','DATAREV':'-'}
++     replacements.update(title_metadata)
++     if cp.dxf.name.lower()=='bt_attc' and a.dxf.tag in replacements:a.dxf.text=replacements[a.dxf.tag]
++     if cp.dxf.name.lower()=='bt_attc' and a.dxf.tag in ['IMPIANTO1','IMPIANTO2']:
++      index=0 if a.dxf.tag=='IMPIANTO1' else 1
++      a.dxf.text=title_lines[index] if index<len(title_lines) else ''
++      fit_title_attribute(a)
++     if cp.dxf.name.lower()=='bt_tabdel_cavi':
++      board=project.get('board',{});characteristics={'TENSIONE_NOMINALE':board.get('voltage','-'),'TENSIONE_NOMINALE_IS':board.get('insulation','-'),'FREQUENZA_NOMINALE':board.get('frequency','-'),'CORRENTE_NOMINALE1':board.get('current',main_current),'CORRENTE_CC':board.get('short_circuit','-'),'CORRENTE_NOMINALE_AMM':board.get('short_time','-'),'TENSIONE_NOM_AUS_AC':board.get('aux_ac','-'),'TENSIONE_NOM_AUS_DC':board.get('aux_dc','-'),'TIPO_SISTEMA':board.get('system','-')}
++      if a.dxf.tag in characteristics:a.dxf.text=str(characteristics[a.dxf.tag])
++  m.delete_entity(pageframe)
++  text(sheet,385,sy+7.5,2.5);text(f'{physical+1:03}' if physical<total_pages else '-',385,sy+2.5,2.5)
++  text(title_metadata['REVISIONE'],120,sy+12.5,1.8);text(title_metadata['DATAREV'],177.5,sy+12.5,1.8)
++  if preview_only:text('BOZZA - DATI E ALIMENTAZIONI NON CONFERMATI',230,sy+267,2.3)
++  # Draw only the buses belonging to each feed; never merge unrelated parents.
++  for group in packed['groups']:
++   parent=group['parent'];items=group['items'];bus_y=sy+group['bus_y'];first_x=items[0]['x'] if items else group['incoming_x'];last_x=group['last_x']
++   if parent and positions[parent]['page']==physical:
++    px=positions[parent]['x'];lane=packed['lanes'][parent]
++    start_x=px+125 if parent in measurement_groups else px
++    line((start_x,sy+142.5),(lane,sy+142.5));line((lane,sy+142.5),(lane,bus_y));line((lane,bus_y),(last_x,bus_y))
++   elif parent:
++    line((group['incoming_x'],bus_y),(last_x,bus_y))
++   elif len(items)==1 and packed['external_column'] is not None:
++    entry=80+25*packed['external_column'];line((entry,sy+142.5),(entry,bus_y));line((entry,bus_y),(last_x,bus_y));m.add_circle((entry,sy+142.5),1.2)
++    root=byid[items[0]['id']]
++    unknown=root.get('connectionStatus')=='da_definire' or (root.get('imported') and root.get('connectionStatus')!='ingresso_esterno_esplicito')
++    text('ALIM. DA DEFINIRE' if unknown else 'ARRIVO LINEA',entry,sy+137.5,1.4)
++   else:
++    if parent is None and packed['external_column'] is not None:
++     entry=80+25*packed['external_column']
++     line((entry,sy+142.5),(entry,bus_y));line((entry,bus_y),(last_x,bus_y));m.add_circle((entry,sy+142.5),1.2)
++     source=byid[items[0]['id']].get('values',{}).get('externalSupplyLabel','ARRIVO LINEA')
++     text(source,entry,sy+137.5,1.25)
++    else:
++     line((first_x,bus_y),(last_x,bus_y));text('ALIM. DA DEFINIRE',first_x,bus_y+3,1.3)
++   if group.get('outgoing_reference'):
++    line((last_x,bus_y),(group['outgoing_x'],bus_y))
++   if parent:
++    wire_names=numbered_conductors(byid[parent],byid,drawing_conductors(byid[parent],byid))
++    start=packed['lanes'][parent] if positions[parent]['page']==physical else group['incoming_x']
++    end=group['outgoing_x'] if group.get('outgoing_reference') else last_x
++    if wire_names and end-start>=25:text(' '.join(wire_names),(start+end)/2,bus_y+2.5,1.5)
++   for item in items:
++    n=byid[item['id']];input_y=sy+min(input_height(n,byid),group['bus_y']-12)
++    line((item['x'],bus_y),(item['x'],input_y));m.add_circle((item['x'],bus_y),.45)
++  drawn_measurements=[]
++  for item in packed['items']:
++   n=byid[item['id']];x=item['x'];kind=n['kind'];is_inline=n['id'] in inline_contacts
++   feed_group=None if is_inline else next(g for g in packed['groups'] if item in g['items'])
++   input_y=sy+input_height(n,byid) if is_inline else sy+min(input_height(n,byid),feed_group['bus_y']-12)
++   values=n['values'];lib_module=None if kind in libreria_moduli.FISSI else libreria_moduli.scegli(codice=values.get('articolo'),poli=values.get('taratura'))
++   scale,length=libreria_moduli.ingombro(lib_module) if lib_module else (1,20 if kind=='QS' else abs(SYMBOLS[kind]['ports'][-1]['xy'][1]))
++   primary=values.get('articolo','');product=specs(primary,CAT[primary]) if primary in CAT else None;plate=device_nameplate(n,product,project.get('settings',{}));attrs=device_attributes(n,product,plate)
++   if kind=='KM':attrs.update(RELE=values.get('coilTag',''),**{'POSIZIONE-BOBINA':values.get('coilReference') or '[DA VERIF.]'})
++   if lib_module:ref,_=libreria_moduli.inserisci(doc,m,lib_module['id'],(x,input_y),{'SIGLA':n['sigla'],'CODICE':primary,**attrs},scale,poli=values.get('taratura'))
++   else:ref=m.add_blockref('BT_'+kind,(x,input_y));ref.add_auto_attribs(attrs)
++   if 'F80RC05' in auxiliary_blocks and 'F80RC05' in [values.get(k,'') for k in ('accessorio_a','accessorio_b','accessorio_c')]:
++    # F80RC05's native listino block is a separate changeover status contact;
++    # place it beside the protected device, not in series with its power poles.
++    aux=m.add_blockref(auxiliary_blocks['F80RC05'],(x+9,input_y))
++    aux.add_auto_attribs({'SIGLA':n['sigla']+'_ST','ARTICOLO':'F80RC05','COSTRUTTORE':'BTICINO'})
++   # Non-breaker red-code apparatus stays visible in a draft as native
++   # catalogue geometry, positioned beside its proposed related branch.
++   modules=n.get('catalogueModules',[])
++   module_offsets={1:[9],2:[-9,9],3:[-15,0,15]}.get(len(modules),[9])
++   for module,dx in zip(modules,module_offsets):
++    article=module.get('article');block=auxiliary_blocks.get(article)
++    if not block:continue
++    aux=m.add_blockref(block,(x+dx,input_y))
++    aux.add_auto_attribs({'SIGLA':n['sigla']+'_ACC','ARTICOLO':article,'COSTRUTTORE':'BTICINO'})
++   inline_child=byid.get(inline_children.get(n['id']))
++   output_end=sy+input_height(inline_child,byid) if inline_child else sy+142.5
++   if output_end>=input_y-length:raise ValueError('Moduli in serie sovrapposti: '+n['sigla'])
++   line((x,input_y-length),(x,output_end))
++   if n.get('connectionReview',{}).get('status')=='proposed':
++    text('RIMANDO',x+7,input_y-5,1.2);text('DA VERIF.',x+7,input_y-7,1.2)
++   phase=values.get('fase')
++   names=drawing_conductors(n,byid);conductors=numbered_conductors(n,byid,names)
++   if is_inline and not explicit_wire_identifiers(n):
++    # Own standard adds A to outgoing wire identity after the series contact.
++    conductors=[v+'A' for v in numbered_conductors(byid[n['parent']],byid,names)]
++   if conductors:
++    # L? is explicitly unresolved; incoming identifiers belong to the feeder.
++    incoming=numbered_conductors(byid[n['parent']],byid,names) if n.get('parent') else conductors
++    output_marker=(input_y-length+output_end)/2 if inline_child else min(sy+160.85,input_y-length-7)
++    markers=[(output_marker,conductors)] if is_inline else [(input_y+5.25,incoming),(output_marker,conductors)]
++    for marker_y,labels in markers:
++     if not labels:continue
++     marker=wire_marker(names)
++     if marker:m.add_blockref(marker,(x,marker_y))
++     for caption,dx,dy in marker_label_rows(labels):
++      m.add_text(caption,dxfattribs={'height':1.5,'style':'Standard'}).set_placement((x+dx,marker_y+dy),align=TextEntityAlignment.LEFT)
++   elif phase:text(phase,x+7,sy+175,1.6)
++   if not children[n['id']] and n['id'] not in measurement_feeders:m.add_circle((x,sy+142.5),1.2)
++   if n['id'] in measurement_groups:
++    if feed_group['bus_y']<250:raise ValueError('Misura su barra troppo bassa: instradamento da completare senza sovrapposizioni.')
++    drawn_measurements.append(draw_measurement(doc,measurement_groups[n['id']],x,sy,text,line,n,fieldrows))
++   if is_inline:continue # Contact attributes retain its own article; one circuit cartiglio.
++   text(n['sigla'],x,sy+127.5)
++   for k,y in fieldrows.items():
++    if n['id'] in measurement_groups and k in ['tipo_cavo','composizione_cavo','lunghezza_m']:continue
++    value=n['label'] if k=='utenza' else values.get(k,'')
++    if n.get('fieldReview',{}).get(k,{}).get('status')=='ambiguous':value='DA VERIF.'
++    if k=='taratura' and values.get('conflict_current'):value='DA VERIF.'
++    if k=='potere_interruzione' and kind in ['MT','MTD']:value=plate['display']
++    if kind=='QS':
++     if k=='campo_regolazione' and not value:value=values.get('taratura','')
++     elif k=='taratura':value=''
++    if not value:continue
++    lines,height=fit_caption(value) if k=='utenza' else ([str(value)],1.8)
++    if k!='utenza' and len(str(value))>28:raise ValueError('Dato troppo lungo per la colonna: '+n['sigla']+' '+k)
++    step=height*1.45
++    for row,val in enumerate(lines):text(val,x,sy+y+(len(lines)-1)*step/2-row*step,height)
++  sheet_references=[e for e in references if e['sheet']==physical]
++  for endpoint in sheet_references:
++   x,y=endpoint['xy'];anchor=(x,sy+y)
++   ref=m.add_blockref('BT_RIMANDO_'+endpoint['role'],anchor)
++   ref.add_auto_attribs({'SEGNALE':endpoint['signal'],'PRES':endpoint['role'],'#LINEA':endpoint['branch'],'REG':endpoint['target'],'FOGLIO':sheet,'CATENARIA':endpoint['address'].split('-',1)[1],'NET_ID':str(endpoint['net']),'ENDPOINT_ID':endpoint['id'],'PARTNER_ID':endpoint['partner']})
++   text(endpoint['text'],x+(8 if y==142.5 else 0),sy+y+3,1.5)
++  ps=doc.layouts.new('A4_'+sheet);ps.page_setup(size=(297,210),margins=(7.5,7.5,7.5,7.5),units='mm',device='DWG To PDF.pc3');ps.main_viewport().dxf.layer='0';ps.add_viewport(center=(141,97.5),size=(195*397.5/275,195),view_center_point=(198.75,sy+137.5),view_height=275,dxfattribs={'layer':'VIEWPORTS','flags':16384});report.append({'sheet':sheet,'feeds':[v['parent'] for v in packed['groups']],'devices':[byid[v['id']]['sigla'] for v in packed['items']],'references':[e['id'] for e in sheet_references],'used_columns':packed['used_columns'],'layout':ps.name,'measurements':drawn_measurements})
++ if has_front:
++  from mhq_import import append_front
++  report.append(append_front(doc,project['mhq'],total_pages,frame,project,preview_only))
+  report.append(append_title_cover(doc,project,total_pages,preview_only))
+  report.append(append_index(doc,project,report,total_pages,preview_only))
+- report.sort(key=lambda r:int(r['sheet']))
+- for r in report:
+-  r['totalPages']=total_pages
+-  doc.layouts.get(r['layout']).dxf.taborder=int(r['sheet'])
+- for l in list(doc.layouts):
+-  if l.name!='Model' and not l.name.startswith('A4_'):doc.layouts.delete(l.name)
++ report.sort(key=lambda r:int(r['sheet']))
++ for r in report:
++  r['totalPages']=total_pages
++  doc.layouts.get(r['layout']).dxf.taborder=int(r['sheet'])
++ for l in list(doc.layouts):
++  if l.name!='Model' and not l.name.startswith('A4_'):doc.layouts.delete(l.name)
+  from page_arrangement import rearrange_horizontal
+  rearrange_horizontal(doc,report)
+- doc.header['$TILEMODE']=1;assert not doc.audit().errors;dxf=folder/'schema.dxf';doc.saveas(dxf)
+- pdf=None
+- if has_front or native_preview:
+-  from mhq_import import render_a4
+-  pdf=folder/'schema.pdf';render_a4(dxf,report,pdf)
+- if preview_only and not native_preview:return {'dxf':str(dxf),'pdf':str(pdf) if pdf else None,'pages':report,'folder':str(folder),'confirmed':False}
+- dwg=folder/'schema.dwg';script=folder/'salva.scr';script.write_text('\n'.join(['(setvar "FILEDIA" 0)','(setvar "FIELDEVAL" 0)','(command "_.AUDIT" "_Yes")',f'(command "_.SAVEAS" "2018" "{dwg.as_posix()}")','(command "_.AUDIT" "_No")','_.QUIT','_Yes','']),encoding='ascii')
+- exe=config.percorso('autocad_console')
+- if not exe.exists():return {'exportId':token,'dxf':f'/exports/{token}/schema.dxf','warning':'AutoCAD Core Console non disponibile; esportato DXF.'}
+- r=subprocess.run([str(exe),'/i',str(dxf),'/s',str(script),'/l','en-US'],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,creationflags=subprocess.CREATE_NO_WINDOW,timeout=90);raw=r.stdout;log=raw.decode('utf-16-le',errors='replace') if raw.count(b'\0')>len(raw)//8 else raw.decode(errors='replace');log=log.replace('\0','');(folder/'AutoCAD.log').write_text(log,encoding='utf-8')
++ doc.header['$TILEMODE']=1;assert not doc.audit().errors;dxf=folder/'schema.dxf';doc.saveas(dxf);live_preview.finish(m,'DXF salvato. Verifica AutoCAD…' if not preview_only or native_preview else 'DXF salvato.')
++ pdf=None
++ if has_front or native_preview:
++  from mhq_import import render_a4
++  pdf=folder/'schema.pdf';render_a4(dxf,report,pdf)
++ if preview_only and not native_preview:return {'dxf':str(dxf),'pdf':str(pdf) if pdf else None,'pages':report,'folder':str(folder),'confirmed':False}
++ dwg=folder/'schema.dwg';script=folder/'salva.scr';script.write_text('\n'.join(['(setvar "FILEDIA" 0)','(setvar "FIELDEVAL" 0)','(command "_.AUDIT" "_Yes")',f'(command "_.SAVEAS" "2018" "{dwg.as_posix()}")','(command "_.AUDIT" "_No")','_.QUIT','_Yes','']),encoding='ascii')
++ exe=config.percorso('autocad_console')
++ if not exe.exists():return {'exportId':token,'dxf':f'/exports/{token}/schema.dxf','warning':'AutoCAD Core Console non disponibile; esportato DXF.'}
++ r=subprocess.run([str(exe),'/i',str(dxf),'/s',str(script),'/l','en-US'],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,creationflags=subprocess.CREATE_NO_WINDOW,timeout=90);raw=r.stdout;log=raw.decode('utf-16-le',errors='replace') if raw.count(b'\0')>len(raw)//8 else raw.decode(errors='replace');log=log.replace('\0','');(folder/'AutoCAD.log').write_text(log,encoding='utf-8')
+  if not dwg.exists() or not re.search(r'Total errors found\s+0\s+fixed\s+0',log):
+   if preview_only and pdf and pdf.exists():
+    return {'exportId':token,'pdf':f'/exports/{token}/schema.pdf','dxf':f'/exports/{token}/schema.dxf','pages':len(report),'devices':len(byid),'previewOnly':True,'confirmed':False,'warning':'Bozza PDF generata. DWG non verificato: consultare AutoCAD.log.','report':f'/exports/{token}/AutoCAD.log'}
+   raise ValueError('DWG non verificato: consultare il log AutoCAD.')
+- (folder/'verifica.json').write_text(json.dumps({'preview_only':preview_only,'native_audit_errors':0,'device_count':len(byid),'pages':report,'all_geometry_in_model':True,'paper':'A4 landscape','viewport_locked':True,'limitations':['No cable sizing, selectivity or assembly verification is performed.','CAD correctness and catalogue filtering do not establish electrical compliance.']},indent=2),encoding='utf-8')
+- return {'exportId':token,'dwg':f'/exports/{token}/schema.dwg','dxf':f'/exports/{token}/schema.dxf','pdf':f'/exports/{token}/schema.pdf' if pdf else None,'report':f'/exports/{token}/verifica.json','pages':len(report),'devices':len(byid),'auditErrors':0,'previewOnly':preview_only,'confirmed':not preview_only}
++ (folder/'verifica.json').write_text(json.dumps({'preview_only':preview_only,'native_audit_errors':0,'device_count':len(byid),'pages':report,'all_geometry_in_model':True,'paper':'A4 landscape','viewport_locked':True,'limitations':['No cable sizing, selectivity or assembly verification is performed.','CAD correctness and catalogue filtering do not establish electrical compliance.']},indent=2),encoding='utf-8')
++ return {'exportId':token,'dwg':f'/exports/{token}/schema.dwg','dxf':f'/exports/{token}/schema.dxf','pdf':f'/exports/{token}/schema.pdf' if pdf else None,'report':f'/exports/{token}/verifica.json','pages':len(report),'devices':len(byid),'auditErrors':0,'previewOnly':preview_only,'confirmed':not preview_only}
+diff --git a/Alpha/packing.py b/Alpha/packing.py
+index ae7f5da..b1a739f 100644
+--- a/Alpha/packing.py
++++ b/Alpha/packing.py
+@@ -33,7 +33,7 @@ def plan_pages(nodes,capacity=12):
+    pages.append(page);reserved,external=source_reservation(this_sheet);page={'items':[],'lanes':{},'start_column':reserved,'external_column':external};column=reserved
+   row={'id':ident,'column':column,'x':80+25*column,'grid':GRID[column],'span':span};page['items'].append(row)
+   positions[ident]={**row,'page':len(pages)+1}
+-  if children[ident]:page['lanes'][ident]=80+25*(column+1)
++  if children[ident]:page['lanes'][ident]=80+25*(column+span)
+   column+=width
+  if page['items']:pages.append(page)
+  grouped_pages=[]
+diff --git a/Alpha/pdf_annotazioni.py b/Alpha/pdf_annotazioni.py
+index e25fb41..9498337 100644
+--- a/Alpha/pdf_annotazioni.py
++++ b/Alpha/pdf_annotazioni.py
+@@ -85,3 +85,26 @@ def estrai_articoli(sorgente) -> list[dict]:
+ 
+ def codici(sorgente) -> collections.Counter:
+     return collections.Counter(c for articolo in estrai_articoli(sorgente) for c in articolo['codici'])
++
++
++_TOKEN_TESTO = re.compile(r'[A-Z0-9][A-Z0-9/\-]*[A-Z0-9]')
++
++
++def _e_articolo_testo(token: str) -> bool:
++    if not listino.esiste(token):
++        return False
++    return bool(re.fullmatch(r'\d{6}', token) or (re.search(r'[A-Z]', token) and re.search(r'\d', token)))
++
++
++def codici_da_testo_pagine(sorgente) -> collections.Counter:
++    """Codici in listino scritti come testo normale della pagina (PDF senza annotazioni FreeText)."""
++    pagine, da_chiudere = _pagine(sorgente)
++    conteggio: collections.Counter = collections.Counter()
++    try:
++        for pagina in pagine:
++            testo = pagina.get_text().upper()
++            conteggio.update(t for t in _TOKEN_TESTO.findall(testo) if _e_articolo_testo(t))
++    finally:
++        if da_chiudere is not None:
++            da_chiudere.close()
++    return conteggio
+diff --git a/strumenti/report_golden.py b/strumenti/report_golden.py
+index 4805b11..7fcb9ab 100644
+--- a/strumenti/report_golden.py
++++ b/strumenti/report_golden.py
+@@ -61,9 +61,11 @@ def codici_asbuilt(percorsi) -> set[str]:
+ def metrica(nome: str, matricola: str | None) -> dict:
+     percorso = trova_input(nome)
+     riga = {'matricola': matricola, 'input': nome, 'trovato': percorso is not None}
+-    codici_input = set(pdf_annotazioni.codici(percorso)) if percorso else set()
++    codici_annot = set(pdf_annotazioni.codici(percorso)) if percorso else set()
++    codici_testo = set(pdf_annotazioni.codici_da_testo_pagine(percorso)) if percorso else set()
++    codici_input = codici_annot | codici_testo
+     non_in_listino = sorted(c for c in codici_input if not listino.esiste(c))
+-    riga.update(codici_input=len(codici_input), non_in_listino=non_in_listino)
++    riga.update(codici_input=len(codici_input), codici_solo_testo=len(codici_testo - codici_annot), non_in_listino=non_in_listino)
+     asbuilt = pdf_asbuilt(matricola) if matricola else []
+     if asbuilt:
+         codici_ab = codici_asbuilt(asbuilt)
+diff --git a/tests/test_packing_misura.py b/tests/test_packing_misura.py
+new file mode 100644
+index 0000000..bc9b282
+--- /dev/null
++++ b/tests/test_packing_misura.py
+@@ -0,0 +1,24 @@
++"""Un modulo largo (misura) con derivazioni: la corsia di ritorno sta dopo il modulo."""
++import packing
++
++
++def _nodi():
++    return [
++        {'id': 'a', 'parent': None, 'drawingWidth': 6, 'values': {}},
++        {'id': 'b', 'parent': 'a', 'values': {}},
++    ]
++
++
++def test_corsia_dopo_modulo_largo():
++    pagine, posizioni, _ = packing.plan_pages(_nodi())
++    assert posizioni['a']['span'] == 6
++    corsia = pagine[0]['lanes']['a']
++    assert corsia == posizioni['a']['x'] + 25 * 6
++    assert posizioni['b']['x'] > corsia
++
++
++def test_corsia_modulo_stretto_invariata():
++    nodi = _nodi()
++    del nodi[0]['drawingWidth']
++    pagine, posizioni, _ = packing.plan_pages(nodi)
++    assert pagine[0]['lanes']['a'] == posizioni['a']['x'] + 25
+-- 
+2.43.0
+
