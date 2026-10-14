@@ -363,7 +363,7 @@
   words=[]
   for r in csv.DictReader(io.StringIO(result.stdout.decode('utf-8',errors='replace')),delimiter='\t'):
    if not r.get('text','').strip():continue
-@@ -182,7 +182,7 @@
+@@ -182,20 +182,60 @@
    image.crop(tuple(round(v*8) for v in (x0-1,y0-1,x1+1,y1+1))).convert('L').save(target)
    readings=[]
    for mode in (7,13):
@@ -372,7 +372,62 @@
     readings.append(run.stdout.decode('utf-8',errors='replace').strip())
    agreed=bool(readings[0]) and readings[0]==readings[1]
    result.append({**word,'text':readings[0] if agreed else token,'originalText':token,'refinement':{'method':'8x tight word OCR; psm7 and psm13','readings':readings,'accepted':agreed}})
-@@ -209,7 +209,7 @@
+  return result
+ 
+ 
+-def outlined_label(words,table,axis):
++_LINGUA_OCR=None
++
++def ocr_language():
++ """'ita' se installata (migliora molto i nomi delle utenze), altrimenti 'eng'."""
++ global _LINGUA_OCR
++ if _LINGUA_OCR is None:
++  _LINGUA_OCR='eng'
++  try:
++   out=subprocess.run([str(TESSERACT),'--list-langs'],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0),timeout=15).stdout.decode('utf-8',errors='replace')
++   if 'ita' in out.split():_LINGUA_OCR='ita'
++  except (OSError,subprocess.SubprocessError):pass
++ return _LINGUA_OCR
++
++def label_quality(text):
++ """Quota di parole plausibili: almeno due lettere con una vocale e senza cifre mescolate."""
++ tokens=re.findall(r"[A-Za-zÀ-ÿ0-9']+",text)
++ if not tokens:return 0.0
++ good=sum(1 for t in tokens if (len(t)<=2 and t.isalpha()) or (re.search(r'[AEIOUaeiouÀ-ÿ]',t) and not re.search(r'[0-9]',t) and not re.search(r'[^AEIOUaeiou]{5,}',t)))
++ return good/len(tokens)
++
++def tight_cell_text(page,box):
++ """OCR della sola cella (zoom 4, blocco di testo): spesso piu' fedele dell'OCR di pagina."""
++ if not TESSERACT.is_file():return ''
++ x0,y0,x1,y1=box
++ if x1-x0<6 or y1-y0<4:return ''
++ pix=page.get_pixmap(matrix=pymupdf.Matrix(4,4),clip=pymupdf.Rect(x0,y0,x1,y1),alpha=False)
++ image=Image.frombytes('RGB',[pix.width,pix.height],pix.samples).convert('L')
++ import numpy as np,tempfile
++ pixels=np.asarray(image).copy();pixels[(pixels<220).mean(axis=1)>.75]=255;pixels[:,(pixels<220).mean(axis=0)>.85]=255
++ image=Image.fromarray(np.pad(pixels,20,constant_values=255))
++ with tempfile.TemporaryDirectory() as folder:
++  file=pathlib.Path(folder)/'cella.png';image.save(file)
++  run=subprocess.run([str(TESSERACT),str(file),'stdout','--psm','6','-l',ocr_language()],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0),timeout=20)
++ return re.sub(r'\s+',' ',run.stdout.decode('utf-8',errors='replace')).strip()
++
++def outlined_label(words,table,axis,page=None):
+  bounds=next(((a,b) for a,b in table['cells'] if a<axis<b),None)
+  if bounds is None:return '',None
+  a,b=bounds;selected=[w for w in words if a+1<(w['box'][0]+w['box'][2])/2<b-1 and table['top']+.5<(w['box'][1]+w['box'][3])/2<table['bottom']-.5]
+  selected.sort(key=lambda w:(round(w['box'][1]/4),w['box'][0]))
+  text=' '.join(w['text'].replace('_',' ') for w in selected).strip()
+- return text,{'source':'OCR bounded by vector table cell','box':[a,table['top'],b,table['bottom']],'words':selected,'text':text}
++ info={'source':'OCR bounded by vector table cell','box':[a,table['top'],b,table['bottom']],'words':selected,'text':text}
++ if page is not None:
++  tight=tight_cell_text(page,[a+.5,table['top']+.5,b-.5,table['bottom']-.5])
++  if tight and label_quality(tight)>=label_quality(text):
++   info.update({'source':'OCR di cella a zoom 4','pageOcrText':text,'text':tight});text=tight
++ return text,info
+ 
+ 
+ def read_cell(image,box,folder,key):
+@@ -209,7 +249,7 @@
   if key.endswith('current'):command+=['-c','tessedit_char_whitelist=0123456789PpNnxX+/']
   elif key.endswith('curve'):command+=['-c','tessedit_char_whitelist=0123456789BCD/']
   elif key.endswith('ka'):command+=['-c','tessedit_char_whitelist=0123456789.,-']
@@ -381,7 +436,7 @@
   return result.stdout.decode('utf-8',errors='replace').strip()
  
  def read_schedule_label(image,axis,half_width,heading_y,folder,key):
-@@ -238,7 +238,7 @@
+@@ -238,7 +278,7 @@
   file=folder/(key+'_full.png');crop.save(file)
   readings=[]
   for mode in (6,11,7):
@@ -390,7 +445,7 @@
    raw=' '.join(r.stdout.decode('utf-8',errors='replace').split())
    # A schedule name is in its own ruled row; discard voltage leakage from the
    # following row without using switch ratings or labels as guessed values.
-@@ -341,7 +341,7 @@
+@@ -341,7 +381,7 @@
     for mode,whitelist in [(7,'0123456789.PAG'),(13,None)]:
      command=[str(TESSERACT),str(file),'stdout','--psm',str(mode)]
      if whitelist:command+=['-c','tessedit_char_whitelist='+whitelist]
@@ -399,7 +454,7 @@
      match=re.fullmatch(r'PAG\.?\s*(\d{1,3})\.?',read.stdout.decode('utf-8',errors='replace').strip(),re.I)
      readings.append(match[1] if match else None)
     if readings[0] and readings[0]==readings[1]:word={**word,'originalText':word['text'],'text':'PAG.'+readings[0],'refinement':'8x crop; psm7 and psm13 agree'}
-@@ -361,7 +361,7 @@
+@@ -361,7 +401,7 @@
    readings['cell']=original
    if re.fullmatch(r'\d{1,2}G\d+(?:\.\d+)?',original):candidates.add(original)
   for mode in [6,7,13]:
@@ -408,7 +463,16 @@
    tokens=[r for r in csv.DictReader(io.StringIO(run.stdout.decode('utf-8',errors='replace')),delimiter='\t') if r.get('text','').strip()]
    text=''.join(r['text'] for r in tokens).strip().replace(',','.').replace(' ','').upper();readings['psm'+str(mode)]=text
    readings['confidence']['psm'+str(mode)]=min((float(r['conf']) for r in tokens),default=0)
-@@ -761,7 +761,12 @@
+@@ -635,7 +675,7 @@
+       if label_raw:label_review={'status':'ambiguous','raw':label_raw,'readings':label_ocr.get('readings',[]) if label_ocr else [],'reason':'OCR da tabella raster non sufficientemente affidabile'}
+     elif len(re.findall(r'[A-Za-zÀ-ÿ]',candidate))>=4 and '\ufffd' not in candidate:label=candidate
+    if outline_table:
+-    label_raw,label_ocr=outlined_label(table_words,outline_table,axis)
++    label_raw,label_ocr=outlined_label(table_words,outline_table,axis,page)
+     if len(re.findall(r'[A-Za-zÀ-ÿ]',label_raw))>=4:
+      label=label_raw
+      label_review={'status':'proposed','raw':label_raw,'reason':'OCR della cella delimitata da bordi vettoriali; verificare la denominazione sul PDF.'}
+@@ -761,7 +801,18 @@
    except ValueError as error:
     node['ratingReview']={'status':'blocked','message':str(error)}
     node['warnings'].append('Verifica kA: '+str(error))
@@ -418,10 +482,16 @@
 + if topology_records:
 +  from unwired_siblings import adotta as adopt_unwired
 +  adopt_unwired(nodes)
++ from etichette import correggi_etichetta
++ for n in nodes:
++  if n.get('label') and not n['label'].startswith('Utenza da'):
++   fixed,changes=correggi_etichetta(n['label'])
++   if changes:
++    n['evidence']['labelRaw']=n['label'];n['evidence']['labelCorrections']=changes;n['label']=fixed
   # Raster schedules can still expose bus segments after vector geometry has
   # been flattened. Treat each uninterrupted segment as evidence; never infer
   # that every device on a sheet is downstream of the largest breaker.
-@@ -838,6 +843,9 @@
+@@ -838,6 +889,9 @@
    item['redAnnotations']=[{'text':note['text'],'box':note['bbox'],'catalogueMatch':note['catalogueMatch']} for note in notes if note['page']==item['page']]
   update('anteprime',96,'Verifica finale delle evidenze sovrapposte al PDF.',previewPages=project['scanPreview'],currentPage=len(doc),totalPages=len(doc),nodesDetected=len(nodes))
   if protective_networks:project['protectiveNetworks']=protective_networks
@@ -593,6 +663,108 @@
              spans.append({'text': ' '.join(letti) or testo, 'rawText': testo, 'box': box, 'color': ROSSO, 'source': 'claude_vision' if usa_vision else 'ocr',
                            'ocrConfidence': conf, 'ocrLines': [o['text'] for o in righe_ocr],
                            'visionLines': righe_vis or None, 'cropBox': p['box'], **_valida(testo)})
+--- /dev/null
++++ b/Alpha/etichette.py
+@@ -0,0 +1,99 @@
++"""Correzione delle denominazioni delle utenze lette dall'OCR.
++
++I nomi nelle tabelle dei PDF sono tracciati a mano (font CAD a tratto singolo):
++l'OCR li scambia spesso (U/O, I/T, L/C...). Si correggono con il vocabolario dei
++disegni dello studio (``catalogo/vocabolario_utenze.json``, ricavato dai DXF
++as-built) e con confusioni tipiche dell'OCR. Una parola italiana valida non si
++tocca mai (elenco generale ``catalogo/parole_it.txt.gz``) e un candidato non
++univoco lascia la parola com'e'. Il risultato resta una proposta da confermare.
++"""
++from __future__ import annotations
++
++import gzip
++import json
++import re
++from functools import lru_cache
++from pathlib import Path
++
++CATALOGO = Path(__file__).resolve().parents[1] / 'catalogo'
++COSTO_INDEL = .7
++COSTO_CONFUSIONE = .35
++CONFUSIONI = {frozenset(p) for p in ('UO', 'IT', 'LC', 'LI', 'EF', 'RK', 'UC', 'CO', 'GC', 'OQ', 'DO', 'BR', 'AH', 'NM', 'VU', 'IJ')}
++_PAROLA = re.compile(r"[A-Za-zÀ-ÿ']+")
++
++
++@lru_cache(maxsize=1)
++def dominio() -> dict[str, int]:
++    percorso = CATALOGO / 'vocabolario_utenze.json'
++    return json.loads(percorso.read_text(encoding='utf-8')) if percorso.is_file() else {}
++
++
++@lru_cache(maxsize=1)
++def generale() -> frozenset[str]:
++    percorso = CATALOGO / 'parole_it.txt.gz'
++    if not percorso.is_file():
++        return frozenset()
++    with gzip.open(percorso, 'rt', encoding='utf-8') as file:
++        return frozenset(riga.strip() for riga in file)
++
++
++def distanza(a: str, b: str, limite: float) -> float:
++    """Levenshtein pesata: le confusioni OCR costano meno di una sostituzione qualsiasi."""
++    if abs(len(a) - len(b)) * COSTO_INDEL > limite:
++        return limite + 1
++    precedente = [j * COSTO_INDEL for j in range(len(b) + 1)]
++    for i in range(1, len(a) + 1):
++        corrente = [i * COSTO_INDEL] + [0.0] * len(b)
++        for j in range(1, len(b) + 1):
++            if a[i - 1] == b[j - 1]:
++                sost = 0.0
++            else:
++                sost = COSTO_CONFUSIONE if frozenset((a[i - 1], b[j - 1])) in CONFUSIONI else 1.0
++            corrente[j] = min(precedente[j] + COSTO_INDEL, corrente[j - 1] + COSTO_INDEL, precedente[j - 1] + sost)
++        if min(corrente) > limite:
++            return limite + 1
++        precedente = corrente
++    return precedente[-1]
++
++
++def correggi_parola(parola: str, voc: dict[str, int] | None = None, valide: frozenset[str] | None = None) -> str:
++    voc = dominio() if voc is None else voc
++    valide = generale() if valide is None else valide
++    maiuscola = parola.upper()
++    if len(maiuscola) < 4 or maiuscola in voc or maiuscola in valide:
++        return parola
++    limite = min(2.2, .30 * len(maiuscola) + .3)
++    candidati = sorted((distanza(maiuscola, w, limite), -c, w) for w, c in voc.items() if len(w) >= 4)
++    if candidati and candidati[0][0] <= limite:
++        migliore = candidati[0]
++        for altro in candidati[1:4]:
++            if altro[2] != migliore[2] and altro[0] - migliore[0] < .15 and -altro[1] * 4 >= -migliore[1]:
++                return parola  # candidati equivalenti: non scegliere
++        return migliore[2]
++    # Parola non del vocabolario dello studio: solo il dizionario generale, con soglia piu' stretta e candidato unico.
++    stretto = min(1.1, limite)
++    vicini = sorted((distanza(maiuscola, w, stretto), w) for w in valide if abs(len(w) - len(maiuscola)) <= 1)
++    vicini = [v for v in vicini if v[0] <= stretto]
++    if len(vicini) >= 1 and (len(vicini) == 1 or vicini[1][0] - vicini[0][0] >= .3):
++        return vicini[0][1]
++    return parola
++
++
++@lru_cache(maxsize=4096)
++def _corretta(parola: str) -> str:
++    return correggi_parola(parola)
++
++
++def correggi_etichetta(testo: str, voc: dict[str, int] | None = None, valide: frozenset[str] | None = None) -> tuple[str, list[dict]]:
++    """Testo corretto e elenco delle sostituzioni {da, a}; i token con cifre non si toccano."""
++    modifiche: list[dict] = []
++    usa_cache = voc is None and valide is None
++
++    def sostituisci(match: re.Match) -> str:
++        parola = match.group(0)
++        nuova = _corretta(parola) if usa_cache else correggi_parola(parola, voc, valide)
++        if nuova.upper() != parola.upper() or (nuova != parola and parola != parola.upper()):
++            modifiche.append({'da': parola, 'a': nuova})
++        return nuova
++
++    return _PAROLA.sub(sostituisci, testo), modifiche
 --- a/strumenti/report_golden.py
 +++ b/strumenti/report_golden.py
 @@ -61,9 +61,11 @@
@@ -794,6 +966,36 @@
 +
 +def test_codice_sconosciuto_senza_correzione():
 +    assert listino.correggi_ocr('ZZZZZZ9') is None
+--- /dev/null
++++ b/tests/test_etichette.py
+@@ -0,0 +1,27 @@
++import etichette as et
++
++VOC = {'LABORATORIO': 50, 'RIUNIONI': 40, 'UFFICIO': 80, 'SECONDO': 30, 'PIANO': 60, 'BAGNO': 20, 'SERVIZIO': 25}
++VALIDE = frozenset({'STAMPA', 'PRESIDENTE'})
++
++
++def test_corregge_confusioni_ocr():
++    testo, mod = et.correggi_etichetta('LABURAIURIU RLUNLUNI', VOC, VALIDE)
++    assert testo == 'LABORATORIO RIUNIONI' and len(mod) == 2
++
++
++def test_parola_valida_non_toccata():
++    assert et.correggi_etichetta('ARCHIVIO E STAMPA', VOC, VALIDE)[0] == 'ARCHIVIO E STAMPA'
++    assert et.correggi_etichetta('ZONA PRESIDENTE', VOC, VALIDE)[0] == 'ZONA PRESIDENTE'
++
++
++def test_token_con_cifre_e_parole_corte_intatti():
++    assert et.correggi_etichetta('QF 12A E 3P+N', VOC, VALIDE) == ('QF 12A E 3P+N', [])
++
++
++def test_nessun_candidato_vicino():
++    assert et.correggi_etichetta('XKQWZPLM', VOC, VALIDE)[0] == 'XKQWZPLM'
++
++
++def test_vocabolario_reale_caricato():
++    assert et.dominio() and 'RISERVA' in et.dominio()
++    assert 'STAMPA' in et.generale()
 --- a/Alpha/frontend/src/hierarchy.ts
 +++ b/Alpha/frontend/src/hierarchy.ts
 @@ -79,7 +79,8 @@
